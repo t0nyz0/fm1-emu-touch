@@ -245,7 +245,9 @@ static void FM1SetExclusivity(NSView *view, NSInteger value) {
 
 void *fm1_touch_attach(void *pointer, bool isWindow) {
     if (![NSThread isMainThread] || !pointer) return NULL;
-    if (@available(macOS 27.0, *)) {
+    // Foundation's runtime query avoids Clang's availability helper symbol,
+    // which Rust's -nodefaultlibs link does not supply on older SDK runners.
+    if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){27, 0, 0}]) {
         id object = (__bridge id)pointer;
         NSView *view;
         if (isWindow) {
