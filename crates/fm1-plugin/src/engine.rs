@@ -38,6 +38,8 @@ pub enum Cmd {
     /// Capture live flash, rather than the host-state copy refreshed every two seconds.
     Snapshot { pkg: Arc<Vec<u8>>, reply: mpsc::Sender<Result<Vec<crate::Sector>, String>> },
     Key { id: u8, down: bool },
+    KeyVel(u8),
+    Pressure { id: u8, vel: u8 },
     Enc { enc: u8, clicks: i32 },
     /// SMK-37: an analog input (fm1_soc::smk's ANALOG_*), the next keys' velocity (µs)
     Analog { idx: u8, value: u16 },
@@ -256,6 +258,8 @@ pub fn run(
                 }
                 Cmd::Load { .. } => unreachable!(), // normalized above, after validation
                 Cmd::Key { id, down } => apply(&mut m, Action::Key { id, down }),
+                Cmd::KeyVel(vel) => apply(&mut m, Action::KeyVel { vel }),
+                Cmd::Pressure { id, vel } => apply(&mut m, Action::Pressure { id, vel }),
                 Cmd::Enc { enc, clicks } => apply(&mut m, Action::Enc { enc, clicks }),
                 Cmd::Analog { idx, value } => apply(&mut m, Action::Adc { ch: idx, value: value.min(1023) }),
                 Cmd::Vel(us) => {

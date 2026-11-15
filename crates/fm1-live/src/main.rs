@@ -38,7 +38,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use fm1_core::{Bus, Cpu};
 use fm1_soc::{machine, Action, Soc};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
-use panel::{Ctl, ENCS, H, W};
+use panel::{H, W};
 
 #[path = "../../fm1-emu/src/buildinfo.rs"]
 mod buildinfo;
@@ -48,6 +48,7 @@ mod exclusive;
 mod panel;
 mod wav;
 mod panel_smk;
+mod panel_input;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -1334,9 +1335,6 @@ fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>) -> Vec<midir::MidiInputConne
     conns
 }
 
-/// Pixels of vertical mouse drag per encoder click.
-const DRAG_PER_CLICK: f32 = 12.0;
-
 const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
@@ -1550,7 +1548,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut pot = m.soc.periph.adc_value[4];
+    let pot = m.soc.periph.adc_value[4];
 
     let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0), dead: AtomicBool::new(false) });
     #[cfg(windows)]
@@ -1736,15 +1734,11 @@ fn main() {
     let mut fit = fit::Fit::new(W, H);
     let base = panel::base(theme);
     let mut buf = vec![0u32; W * H];
-    let mut down = [false; 41];
-    let mut enc_clicks = [0i32; 7];
-    let mut turning = [0u32; 8];
-    let mut scroll_acc = [0f32; 8];
+    let mut input = panel_input::PanelInput::new(fm1_soc::Board::Fm1, pot);
+    let mut touch = direct_touch(&win);
     let mut shown_leds = [0f32; 41];
-    let mut grab: Option<Ctl> = None;
     let mut was_pressed = false;
-    let mut mouse_vel = 0u8;                    // the key under the mouse: how hard (its height; lower = harder)
-    let (mut last_y, mut drag_acc) = (0f32, 0f32);
+    let mut mouse_ready = true;
     let mut last_title = Instant::now();
     eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
     eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; F3 records a WAV (to Music/fm1-emu); F4 another firmware; Esc quits");
@@ -1752,128 +1746,41 @@ fn main() {
     // F4 picked another firmware: what to start once this run has ended
     let mut next: Option<Vec<String>> = None;
     while win.is_open() && !win.is_key_down(Key::Escape) && next.is_none() {
-        let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 7], turning: &mut [u32; 8]| {
-            enc_clicks[i] += clicks;
-            turning[i] = 10;
-            let _ = tx.send(Action::Enc { enc: ENCS[i].1, clicks });
-        };
-
-        // ---- mouse
+        let active = win.is_active();
+        let mut keys = [false; 64];
+        if active {
+            for k in win.get_keys() {
+                if let Some(id) = piano(k).or_else(|| button(k)) { keys[id as usize] = true; }
+            }
+        }
+        send_input(&tx, input.keyboard(keys, [false; 8]));
+        // Events stay ordered: a full tap between rendered frames still presses and releases.
+        for e in touch.as_mut().map_or_else(Vec::new, |t| t.drain()) {
+            if active {
+                let (x, y) = (e.x * W as f32, e.y * H as f32);
+                send_contact(&tx, &mut input, e, x, y);
+            }
+        }
         let pos = mouse_pos(&win).map(|(x, y)| fit.to_panel(x, y));
-        let pressed = win.get_mouse_down(MouseButton::Left);
-        if let Some((mx, my)) = pos {
-            if pressed && !was_pressed {
-                grab = panel::hit(mx, my);
-                last_y = my;
-                drag_acc = 0.0;
-                if let Some(Ctl::Key(k)) = grab {
-                    mouse_vel = panel::key_vel(k, my);
+        poll_mouse(&win, active, pos, &mut input, &mut was_pressed, &mut mouse_ready, &tx);
+        if !active { send_input(&tx, input.cancel()); }
+        if active {
+            for k in win.get_keys_pressed(KeyRepeat::Yes) {
+                let change = match k {
+                    Key::Left => Some((0, -1)), Key::Right => Some((0, 1)),
+                    Key::Down => Some((1, -1)), Key::Up => Some((1, 1)),
+                    Key::Comma => Some((2, -1)), Key::Period => Some((2, 1)),
+                    Key::F4 => { next = open_another(); None }, _ => None,
+                };
+                if let Some((i, clicks)) = change {
+                    let mut actions = Vec::new(); input.turn(i, clicks, &mut actions); send_input(&tx, actions);
                 }
-            } else if pressed {
-                match grab {
-                    // glissando: the held note follows the pointer across keys; on the same key,
-                    // its height is the pressure (aftertouch)
-                    Some(Ctl::Key(k0)) => {
-                        if let Some(Ctl::Key(k)) = panel::hit(mx, my) {
-                            let v = panel::key_vel(k, my);
-                            if k != k0 {
-                                grab = Some(Ctl::Key(k));
-                                mouse_vel = v;
-                            } else if v.abs_diff(mouse_vel) >= 4 {
-                                mouse_vel = v;
-                                let _ = tx.send(Action::Pressure { id: k, vel: v });
-                            }
-                        }
-                    }
-                    Some(Ctl::Enc(i)) => {
-                        drag_acc += last_y - my;
-                        while drag_acc >= DRAG_PER_CLICK {
-                            drag_acc -= DRAG_PER_CLICK;
-                            turn(i, 1, &mut enc_clicks, &mut turning);
-                        }
-                        while drag_acc <= -DRAG_PER_CLICK {
-                            drag_acc += DRAG_PER_CLICK;
-                            turn(i, -1, &mut enc_clicks, &mut turning);
-                        }
-                    }
-                    Some(Ctl::Pot) => {
-                        let v = (pot as f32 + (last_y - my) * 4.0).clamp(0.0, 1023.0) as u16;
-                        if v != pot {
-                            pot = v;
-                            turning[7] = 10;
-                            let _ = tx.send(Action::Adc { ch: 4, value: pot });
-                        }
-                    }
-                    _ => {}
-                }
-                last_y = my;
-            }
-            if let Some((_, dy)) = win.get_scroll_wheel() {
-                match panel::hit(mx, my) {
-                    Some(Ctl::Enc(i)) => {
-                        scroll_acc[i] += dy;
-                        while scroll_acc[i] >= 1.0 {
-                            scroll_acc[i] -= 1.0;
-                            turn(i, 1, &mut enc_clicks, &mut turning);
-                        }
-                        while scroll_acc[i] <= -1.0 {
-                            scroll_acc[i] += 1.0;
-                            turn(i, -1, &mut enc_clicks, &mut turning);
-                        }
-                    }
-                    Some(Ctl::Pot) => {
-                        pot = (pot as f32 + dy * 24.0).clamp(0.0, 1023.0) as u16;
-                        turning[7] = 10;
-                        let _ = tx.send(Action::Adc { ch: 4, value: pot });
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if !pressed {
-            grab = None;
-        }
-        was_pressed = pressed;
-
-        // ---- held keys and buttons: computer keyboard + mouse
-        let mut want = [false; 41];
-        for k in win.get_keys() {
-            if let Some(id) = piano(k).or_else(|| button(k)) {
-                want[id as usize] = true;
-            }
-        }
-        if let Some(Ctl::Key(id) | Ctl::Btn(id)) = grab {
-            want[id as usize] = true;
-        }
-        for id in 0..41 {
-            if want[id] != down[id] {
-                down[id] = want[id];
-                if want[id] && id >= 14 {
-                    // the mouse's key at its height, the computer keyboard's at 100
-                    let mouse = matches!(grab, Some(Ctl::Key(k)) if k as usize == id);
-                    let _ = tx.send(Action::KeyVel { vel: if mouse { mouse_vel } else { 100 } });
-                }
-                let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
-            }
-        }
-        for k in win.get_keys_pressed(KeyRepeat::Yes) {
-            match k {
-                Key::Left => turn(0, -1, &mut enc_clicks, &mut turning),
-                Key::Right => turn(0, 1, &mut enc_clicks, &mut turning),
-                Key::Down => turn(1, -1, &mut enc_clicks, &mut turning),
-                Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
-                Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
-                Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
-                Key::F4 => next = open_another(),
-                _ => {}
             }
         }
         if win.is_key_pressed(Key::F3, KeyRepeat::No) {
             toggle_record(&recorder, &o.name);
         }
-        for t in turning.iter_mut() {
-            *t = t.saturating_sub(1);
-        }
+        input.tick();
 
         // ---- draw: LEDs fade out over a few frames instead of flickering
         {
@@ -1885,7 +1792,8 @@ fn main() {
         {
             // the emulator thread waits on this lock to publish a frame: copy, then draw unlocked
             let fb = lcd.lock().unwrap().clone();
-            let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
+            let st = panel::State { lcd: &fb, enc_clicks: &std::array::from_fn(|i| input.enc_clicks[i]), pot: input.pot,
+                down: &std::array::from_fn(|i| input.down[i]), leds: &shown_leds, turning: &input.turning };
             panel::draw(&mut buf, &base, &st, theme);
         }
         if let Some(w) = recorder.lock().unwrap().as_ref() {
@@ -1902,6 +1810,8 @@ fn main() {
             last_title = Instant::now();
         }
     }
+    send_input(&tx, input.cancel());
+    drop(touch);
     quit.store(true, Ordering::Relaxed);
     let _ = emu.join();
     // the window closed while recording: the file keeps what was played, with its length
@@ -1942,6 +1852,49 @@ fn toggle_record(rec: &Mutex<Option<wav::Wav>>, name: &str) {
     }
 }
 
+/// Attach only to this minifb window; the retained recognizer detaches before it closes.
+fn direct_touch(win: &Window) -> Option<fm1_touch::TouchInput> {
+    #[cfg(target_os = "macos")]
+    { unsafe { fm1_touch::TouchInput::attach_window(win.get_window_handle()) } }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = win; None }
+}
+
+fn send_input(tx: &mpsc::Sender<Action>, actions: Vec<Action>) {
+    for action in actions { let _ = tx.send(action); }
+}
+
+fn send_contact(tx: &mpsc::Sender<Action>, input: &mut panel_input::PanelInput, e: fm1_touch::Event, x: f32, y: f32) {
+    use fm1_touch::Phase;
+    let actions = match e.phase {
+        Phase::Start => input.start(e.id, x, y), Phase::Move => input.moved(e.id, x, y),
+        Phase::End | Phase::Cancel => input.end(e.id),
+    };
+    send_input(tx, actions);
+}
+
+// A reserved owner keeps physical mouse and finger holds independent. AppKit routes direct
+// contacts through the attached recognizer; indirect trackpad events retain their mouse path.
+const MOUSE_CONTACT: u64 = u64::MAX;
+fn poll_mouse(win: &Window, active: bool, pos: Option<(f32, f32)>, input: &mut panel_input::PanelInput,
+    was_pressed: &mut bool, ready: &mut bool, tx: &mpsc::Sender<Action>) {
+    let pressed = win.get_mouse_down(MouseButton::Left);
+    if !pressed { *ready = true; }
+    if !active { *ready = !pressed; }
+    if active && pressed && *ready {
+        if let Some((x, y)) = pos {
+            let actions = if *was_pressed { input.moved(MOUSE_CONTACT, x, y) } else { input.start(MOUSE_CONTACT, x, y) };
+            send_input(tx, actions);
+        }
+    } else if *was_pressed { send_input(tx, input.end(MOUSE_CONTACT)); }
+    *was_pressed = active && pressed && *ready;
+    if active {
+        if let (Some((x, y)), Some((_, delta))) = (pos, win.get_scroll_wheel()) {
+            send_input(tx, input.scroll(x, y, delta));
+        }
+    }
+}
+
 /// The mouse in the window, clamped to it. Not minifb's MouseMode::Clamp: in 0.28 it panics on a
 /// window of no size (minimized: `width - 1` is negative, and f32::clamp asserts min <= max).
 fn mouse_pos(win: &Window) -> Option<(f32, f32)> {
@@ -1953,8 +1906,7 @@ fn mouse_pos(win: &Window) -> Option<(f32, f32)> {
 /// The SMK-37's window: its panel (panel_smk.rs), the mouse on its keys (velocity: how far down
 /// a key is hit), pads, faders, wheels and knobs; the computer keyboard as on the page.
 fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: &Mutex<[f32; 41]>, pads: &Mutex<[u32; 16]>, status: &Mutex<String>) {
-    use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH, MOD_REST, PITCH_REST};
-    use panel_smk::Ctl as S;
+    use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH};
     let (w, h) = (panel_smk::W, panel_smk::H);
     let mut win = match Window::new(&format!("SMK-37 · {} (emulated)", o.name), w, h, WindowOptions { resize: true, ..WindowOptions::default() }) {
         Ok(w) => w,
@@ -1964,145 +1916,67 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     let base = panel_smk::base();
     let mut buf = vec![0u32; w * h];
     let btn0 = fm1_soc::smk::BTN0;
-    let (mut down, mut enc_clicks, mut turning) = ([false; 64], [0i32; 8], [0u32; 8]);
-    let mut analog = [0u16; 23];
-    analog[ANALOG_PITCH as usize] = PITCH_REST;
-    analog[ANALOG_MOD as usize] = MOD_REST;
-    let mut set_analog = |analog: &mut [u16; 23], i: usize, v: u16| {
-        if analog[i] != v {
-            analog[i] = v;
-            let _ = tx.send(Action::Adc { ch: i as u8, value: v });
-        }
-    };
-    let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 8], turning: &mut [u32; 8]| {
-        enc_clicks[i] += clicks;
-        turning[i] = 10;
-        let _ = tx.send(Action::Enc { enc: i as u8, clicks });
-    };
-    // 0 (softest) .. 1 (hardest) -> 80 ms .. 2 ms between a key's two contacts
-    let vel = |f: f32| Action::Vel { us: (80_000f32.ln() + (2_000f32.ln() - 80_000f32.ln()) * f.clamp(0.0, 1.0)).exp() as u32 };
-    let (mut grab, mut was_pressed, mut last_y, mut drag_acc, mut scroll_acc) = (None, false, 0f32, 0f32, [0f32; 8]);
+    let mut input = panel_input::PanelInput::new(fm1_soc::Board::Smk37, 512);
+    let mut touch = direct_touch(&win);
+    let mut was_pressed = false;
+    let mut mouse_ready = true;
     let mut last_title = Instant::now();
     eprintln!("SMK-37: click the keys (lower = harder), pads, buttons; drag faders, wheels, knobs. A..' C4..F5, Z/X OCTAVE, Space SEQ PLAY, R SEQ REC, 1..8 pads, arrows K1/K2; Esc quits");
     while win.is_open() && !win.is_key_down(Key::Escape) {
-        let pressed = win.get_mouse_down(MouseButton::Left);
-        if let Some((mx, my)) = mouse_pos(&win) {
-            // (the window may be resized: back to panel coordinates)
-            let (ww, wh) = win.get_size();
-            let (mx, my) = (mx * w as f32 / ww.max(1) as f32, my * h as f32 / wh.max(1) as f32);
-            if pressed && !was_pressed {
-                grab = panel_smk::hit(mx, my);
-                last_y = my;
-                drag_acc = 0.0;
-                match grab {
-                    Some(S::Key(_, f)) => { let _ = tx.send(vel(f)); }
-                    Some(S::Pad(p)) => set_analog(&mut analog, p, 700),
-                    _ => {}
-                }
-            }
-            if pressed {
-                match grab {
-                    Some(S::Key(k, _)) => {
-                        if let Some(S::Key(k2, f)) = panel_smk::hit(mx, my) {
-                            if k2 != k {
-                                let _ = tx.send(vel(f));
-                                grab = Some(S::Key(k2, f));
-                            }
-                        }
-                    }
-                    Some(S::Enc(i)) => {
-                        drag_acc += last_y - my;
-                        while drag_acc >= DRAG_PER_CLICK { drag_acc -= DRAG_PER_CLICK; turn(i, 1, &mut enc_clicks, &mut turning); }
-                        while drag_acc <= -DRAG_PER_CLICK { drag_acc += DRAG_PER_CLICK; turn(i, -1, &mut enc_clicks, &mut turning); }
-                    }
-                    Some(S::Fader(f)) => set_analog(&mut analog, 16 + f, panel_smk::fader_value(f, my)),
-                    Some(S::Pitch) => set_analog(&mut analog, ANALOG_PITCH as usize, panel_smk::wheel_value(true, my)),
-                    Some(S::Mod) => set_analog(&mut analog, ANALOG_MOD as usize, panel_smk::wheel_value(false, my)),
-                    _ => {}
-                }
-                last_y = my;
-            }
-            if let Some((_, dy)) = win.get_scroll_wheel() {
-                if let Some(S::Enc(i)) = panel_smk::hit(mx, my) {
-                    scroll_acc[i] += dy;
-                    while scroll_acc[i] >= 1.0 { scroll_acc[i] -= 1.0; turn(i, 1, &mut enc_clicks, &mut turning); }
-                    while scroll_acc[i] <= -1.0 { scroll_acc[i] += 1.0; turn(i, -1, &mut enc_clicks, &mut turning); }
-                }
-            }
-        }
-        if !pressed {
-            match grab {
-                Some(S::Pad(p)) => set_analog(&mut analog, p, 0),
-                Some(S::Pitch) => set_analog(&mut analog, ANALOG_PITCH as usize, PITCH_REST),
-                _ => {}
-            }
-            grab = None;
-        }
-        was_pressed = pressed;
-
-        // held keys and buttons: the computer keyboard (as on the page) and the mouse
-        let mut want = [false; 64];
+        let active = win.is_active();
+        let mut keys = [false; 64];
         let mut pad_keys = [false; 8];
-        for k in win.get_keys() {
-            if let Some(id) = piano(k) {
-                want[(id - 21 + 12) as usize] = true; // (piano() gives the FM-1's ids, C4 = 21)
-            }
-            let b = match k { Key::Z => Some(4), Key::X => Some(5), Key::Space => Some(16), Key::R => Some(17), _ => None };
-            if let Some(b) = b {
-                want[(btn0 + b) as usize] = true;
-            }
-            let pad = [Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::Key5, Key::Key6, Key::Key7, Key::Key8].iter().position(|&p| p == k);
-            if let Some(p) = pad {
-                pad_keys[p] = true;
+        if active {
+            for k in win.get_keys() {
+                if let Some(id) = piano(k) { keys[(id - 21 + 12) as usize] = true; }
+                let b = match k { Key::Z => Some(4), Key::X => Some(5), Key::Space => Some(16), Key::R => Some(17), _ => None };
+                if let Some(b) = b { keys[(btn0 + b) as usize] = true; }
+                if let Some(p) = [Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::Key5, Key::Key6, Key::Key7, Key::Key8].iter().position(|&p| p == k) { pad_keys[p] = true; }
             }
         }
-        for (p, &on) in pad_keys.iter().enumerate() {
-            if grab != Some(S::Pad(p)) {
-                set_analog(&mut analog, p, if on { 700 } else { 0 });
+        send_input(tx, input.keyboard(keys, pad_keys));
+        for e in touch.as_mut().map_or_else(Vec::new, |t| t.drain()) {
+            if active {
+                // minifb stretches this buffer to its content view; normalized points also
+                // handle Retina backing scale and independent horizontal/vertical resizing.
+                let (x, y) = (e.x * w as f32, e.y * h as f32);
+                send_contact(tx, &mut input, e, x, y);
             }
         }
-        match grab {
-            Some(S::Key(id, _)) | Some(S::Btn(id)) => want[id as usize] = true,
-            _ => {}
-        }
-        for id in 0..55 {
-            if want[id] != down[id] {
-                if want[id] && id < 37 && !matches!(grab, Some(S::Key(k, _)) if k as usize == id) {
-                    let _ = tx.send(vel(0.75));
+        let pos = mouse_pos(&win).map(|(x, y)| {
+            let (ww, wh) = win.get_size();
+            (x * w as f32 / ww.max(1) as f32, y * h as f32 / wh.max(1) as f32)
+        });
+        poll_mouse(&win, active, pos, &mut input, &mut was_pressed, &mut mouse_ready, tx);
+        if !active { send_input(tx, input.cancel()); }
+        if active {
+            for k in win.get_keys_pressed(KeyRepeat::Yes) {
+                let change = match k {
+                    Key::Left => Some((0, -1)), Key::Right => Some((0, 1)),
+                    Key::Down => Some((1, -1)), Key::Up => Some((1, 1)),
+                    Key::Comma => Some((2, -1)), Key::Period => Some((2, 1)), _ => None,
+                };
+                if let Some((i, clicks)) = change {
+                    let mut actions = Vec::new(); input.turn(i, clicks, &mut actions); send_input(tx, actions);
                 }
-                down[id] = want[id];
-                let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
             }
         }
-        for k in win.get_keys_pressed(KeyRepeat::Yes) {
-            match k {
-                Key::Left => turn(0, -1, &mut enc_clicks, &mut turning),
-                Key::Right => turn(0, 1, &mut enc_clicks, &mut turning),
-                Key::Down => turn(1, -1, &mut enc_clicks, &mut turning),
-                Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
-                Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
-                Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
-                _ => {}
-            }
-        }
-        for t in turning.iter_mut() {
-            *t = t.saturating_sub(1);
-        }
+        input.tick();
         {
             let fb = lcd.lock().unwrap().clone();
             let l = *leds.lock().unwrap();
             let pc = *pads.lock().unwrap();
             let st = panel_smk::State {
                 lcd: &fb,
-                enc_clicks: &enc_clicks,
-                turning: &turning,
-                down: &down,
+                enc_clicks: &input.enc_clicks,
+                turning: &input.turning,
+                down: &input.down,
                 leds: &std::array::from_fn(|k| l[k]),
                 pads: &pc,
-                pad_force: &std::array::from_fn(|p| analog[p]),
-                faders: &std::array::from_fn(|f| analog[16 + f]),
-                pitch: analog[ANALOG_PITCH as usize],
-                modw: analog[ANALOG_MOD as usize],
+                pad_force: &std::array::from_fn(|p| input.analog[p]),
+                faders: &std::array::from_fn(|f| input.analog[16 + f]),
+                pitch: input.analog[ANALOG_PITCH as usize],
+                modw: input.analog[ANALOG_MOD as usize],
             };
             panel_smk::draw(&mut buf, &base, &st);
         }
@@ -2114,6 +1988,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
             last_title = Instant::now();
         }
     }
+    send_input(tx, input.cancel());
 }
 
 #[cfg(test)]

@@ -1,0 +1,9 @@
+[package]
+name = "fm1-touch"
+description = "Direct macOS display contacts for the FM-1 native frontends"
+version = "0.5.1"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+cc = "1"

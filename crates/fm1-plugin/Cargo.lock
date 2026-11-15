@@ -930,6 +930,7 @@ dependencies = [
  "dispatch2",
  "fm1-core",
  "fm1-soc",
+ "fm1-touch",
  "nih_plug",
  "nih_plug_egui",
  "raw-window-handle 0.6.2",
@@ -946,6 +947,13 @@ name = "fm1-soc"
 version = "0.5.1"
 dependencies = [
  "fm1-core",
+]
+
+[[package]]
+name = "fm1-touch"
+version = "0.5.1"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

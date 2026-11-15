@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{mpsc, Arc, Mutex};
 
 mod editor;
+mod native_editor;
+mod panel_input;
 pub mod engine;
 pub mod savefile;
 #[path = "../../fm1-live/src/wav.rs"]

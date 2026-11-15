@@ -8,15 +8,10 @@ use crate::{panel, panel_smk, Clock, Fm1Params, Lead, Link};
 use fm1_soc::Board;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use crate::panel_input::{Effect, Input, MasterGesture, Pointer};
 
-/// A pointer's grab: what it hit (fm1-web's panel_hit codes), where it was, what it holds.
-struct Grab {
-    ctl: i32,
-    last_y: f32,
-    acc: f32,
-    held: i32,
-}
+pub(super) type SharedInput = Arc<Mutex<(bool, Input)>>;
 
 struct Ui {
     board: Board,
@@ -29,7 +24,10 @@ struct Ui {
     turning: [u32; 9],
     /// SMK-37: its analog inputs as set (fm1_soc::smk's ANALOG_* indices)
     analog: [u16; 23],
-    grab: Option<Grab>,
+    input: SharedInput,
+    session: u64,
+    master: MasterGesture,
+    firmware: Arc<Vec<u8>>,
     wheel_acc: f32,
     msg: String,
     msg_until: Option<std::time::Instant>,
@@ -53,7 +51,10 @@ impl Default for Ui {
             enc_clicks: [0; 8],
             turning: [0; 9],
             analog,
-            grab: None,
+            input: Arc::new(Mutex::new((false, Input::default()))),
+            session: 0,
+            master: MasterGesture::default(),
+            firmware: Arc::new(Vec::new()),
             wheel_acc: 0.0,
             msg: String::new(),
             msg_until: None,
@@ -63,22 +64,38 @@ impl Default for Ui {
     }
 }
 
-const NKEY: i32 = 37;
+impl Ui {
+    fn reopen(&mut self) {
+        self.tex = None;
+        self.down.fill(false);
+        self.master.end();
+        self.analog[..16].fill(0);
+        self.analog[fm1_soc::smk::ANALOG_PITCH as usize] = fm1_soc::smk::PITCH_REST;
+    }
+}
 
 pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>> {
     // (the state outlives a window: one opened again has a new egui context, so the panel's
     // texture, which belongs to the old one, is made again)
+    let input: SharedInput = Arc::new(Mutex::new((false, Input::default())));
+    let session = crate::native_editor::new_session();
+    let initial = Ui { input: input.clone(), session, ..Ui::default() };
+    let wrapped_params = params.clone();
+    let wrapped_link = link.clone();
     let build = |_: &egui::Context, ui: &mut Ui| {
-        ui.tex = None;
-        ui.grab = None;
+        ui.reopen();
     };
-    create_egui_editor(params.editor_state.clone(), Ui::default(), build, move |ctx, setter, ui| {
+    let inner = create_egui_editor(params.editor_state.clone(), initial, build, move |ctx, setter, ui| {
         let (lcd, leds, pads, board, booted, halted, speed, late) = {
             let v = link.shared.view.lock().unwrap();
             (v.lcd.clone(), v.leds, v.pads, v.board, v.booted, v.halted, v.speed, v.late)
         };
-        if board != ui.board || ui.base.is_empty() {
+        let firmware = params.firmware.lock().unwrap().pkg.clone();
+        if board != ui.board || ui.base.is_empty() || !Arc::ptr_eq(&firmware, &ui.firmware) {
+            let effects = { let mut state = ui.input.lock().unwrap(); let smk = state.0; let out = state.1.cancel(smk); state.0 = board == Board::Smk37; out };
+            apply_effects(ui, &params, &link, setter, effects);
             ui.board = board;
+            ui.firmware = firmware;
             ui.base = if board == Board::Smk37 { panel_smk::base() } else { panel::base(panel::Theme::by_name("default")) };
             ui.buf = vec![0; ui.base.len()];
         }
@@ -165,78 +182,43 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
             let resp = c.allocate_rect(rect, egui::Sense::click_and_drag());
             let at = |p: egui::Pos2| ((p.x - rect.min.x) / k, (p.y - rect.min.y) / k);
 
-            // the pointer
-            let (pressed, released, pos, scroll) =
-                ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.interact_pos(), i.raw_scroll_delta.y));
-            if pressed && resp.hovered() {
+            // Coordinates in the native view and egui are both logical, top-left based.
+            // The recognizer only claims the panel; the toolbar keeps its normal egui input.
+            let screen = ctx.input(|i| i.screen_rect());
+            let region = [(rect.min.x - screen.min.x) / screen.width(), (rect.min.y - screen.min.y) / screen.height(), rect.width() / screen.width(), rect.height() / screen.height()];
+            let touch = crate::native_editor::drain(ui.session, region);
+            let (pressed, released, pos, scroll, focused) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released(), i.pointer.interact_pos(), i.raw_scroll_delta.y, i.focused));
+            if !focused || ui.picking.is_some() || ui.job.is_some() || !booted {
+                let effects = ui.input.lock().unwrap().1.cancel(smk);
+                apply_effects(ui, &params, &link, setter, effects);
+            } else {
+                for event in touch {
+                    let p = egui::pos2(screen.min.x + event.x * screen.width(), screen.min.y + event.y * screen.height());
+                    let (x,y) = at(p);
+                    let effects = {
+                        let mut state = ui.input.lock().unwrap();
+                        match event.phase {
+                            fm1_touch::Phase::Start => state.1.start(Pointer::Touch(event.id), smk, x, y),
+                            fm1_touch::Phase::Move => state.1.moved(Pointer::Touch(event.id), smk, x, y),
+                            fm1_touch::Phase::End | fm1_touch::Phase::Cancel => state.1.end(Pointer::Touch(event.id), smk),
+                        }
+                    };
+                    apply_effects(ui, &params, &link, setter, effects);
+                }
+                // Mouse input uses a separate owner, including when a finger already holds
+                // the same key.
                 if let Some(p) = pos {
-                    let (x, y) = at(p);
-                    let ctl = hit(smk, x, y);
-                    let mut g = Grab { ctl, last_y: y, acc: 0.0, held: -1 };
-                    if (100..200).contains(&ctl) {
-                        g.held = ctl - 100;
-                        if smk && g.held < NKEY {
-                            velocity(&link, panel_smk_hit_y(x, y));
-                        }
-                        key(ui, &link, g.held, true);
-                    } else if smk && ctl >= 200 {
-                        slide(ui, &link, ctl, y);
-                    } else if !smk && ctl == 7 {
-                        setter.begin_set_parameter(&params.master);
-                    }
-                    ui.grab = Some(g);
+                    let (x,y) = at(p);
+                    let effects = {
+                        let mut state = ui.input.lock().unwrap();
+                        if pressed && resp.hovered() { state.1.start(Pointer::Mouse, smk, x, y) }
+                        else { state.1.moved(Pointer::Mouse, smk, x, y) }
+                    };
+                    apply_effects(ui, &params, &link, setter, effects);
                 }
-            }
-            if let (Some(g), Some(p)) = (ui.grab.as_mut(), pos) {
-                let (x, y) = at(p);
-                let keys = if smk { 0..NKEY } else { 14..41 };
-                if (100..200).contains(&g.ctl) && keys.contains(&g.held) {
-                    let h = hit(smk, x, y);
-                    if keys.contains(&(h - 100)) && h - 100 != g.held {
-                        let old = g.held;
-                        g.held = h - 100;
-                        let new = g.held;
-                        key(ui, &link, old, false);
-                        if smk {
-                            velocity(&link, panel_smk_hit_y(x, y));
-                        }
-                        key(ui, &link, new, true);
-                    }
-                } else if smk && g.ctl >= 300 {
-                    let ctl = g.ctl;
-                    slide(ui, &link, ctl, y);
-                } else if g.ctl >= 0 && g.ctl < if smk { 8 } else { 7 } {
-                    // 12 px of drag a click
-                    g.acc += g.last_y - y;
-                    let clicks = (g.acc / 12.0).trunc();
-                    g.acc -= clicks * 12.0;
-                    let ctl = g.ctl;
-                    if clicks != 0.0 {
-                        turn(ui, &link, smk, ctl, clicks as i32);
-                    }
-                } else if !smk && g.ctl == 7 {
-                    let v = (params.master.value() + (g.last_y - y) * 4.0 / 1023.0).clamp(0.0, 1.0);
-                    setter.set_parameter(&params.master, v);
-                    ui.turning[7] = 10;
-                }
-                if let Some(g) = ui.grab.as_mut() {
-                    g.last_y = y;
-                }
-            }
-            if released {
-                if let Some(g) = ui.grab.take() {
-                    if g.held >= 0 {
-                        key(ui, &link, g.held, false);
-                    }
-                    if smk && (200..216).contains(&g.ctl) {
-                        analog(ui, &link, (g.ctl - 200) as usize, 0); // a pad let go
-                    }
-                    if smk && g.ctl == 400 {
-                        analog(ui, &link, fm1_soc::smk::ANALOG_PITCH as usize, fm1_soc::smk::PITCH_REST); // springs back
-                    }
-                    if !smk && g.ctl == 7 {
-                        setter.end_set_parameter(&params.master);
-                    }
+                if released {
+                    let effects = ui.input.lock().unwrap().1.end(Pointer::Mouse, smk);
+                    apply_effects(ui, &params, &link, setter, effects);
                 }
             }
             if scroll != 0.0 && resp.hovered() {
@@ -247,10 +229,11 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                         let i = 16 + (h - 300) as usize;
                         analog(ui, &link, i, (ui.analog[i] as f32 + scroll * 2.0).clamp(0.0, 1023.0) as u16);
                     } else if !smk && h == 7 {
-                        let v = (params.master.value() + scroll * 0.5 / 1023.0).clamp(0.0, 1.0);
-                        setter.begin_set_parameter(&params.master);
+                        let v = ui.master.adjust(params.master.value(), scroll * 0.5 / 1023.0);
+                        let held = ui.input.lock().unwrap().1.master_active();
+                        if !held { setter.begin_set_parameter(&params.master); }
                         setter.set_parameter(&params.master, v);
-                        setter.end_set_parameter(&params.master);
+                        if !held { setter.end_set_parameter(&params.master); }
                     } else if (0..if smk { 8 } else { 7 }).contains(&h) {
                         ui.wheel_acc += scroll;
                         while ui.wheel_acc >= 40.0 {
@@ -307,7 +290,43 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
             }
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
-    })
+    })?;
+    Some(crate::native_editor::wrap(inner, session, input, wrapped_params, wrapped_link))
+}
+
+fn apply_effects(ui: &mut Ui, params: &Fm1Params, link: &Link, setter: &ParamSetter, effects: Vec<Effect>) {
+    for effect in effects {
+        match effect {
+            Effect::Key(k, down) => ui.down[k as usize] = down,
+            Effect::Turn(i, clicks) => { ui.enc_clicks[i] += clicks; ui.turning[i] = 10; }
+            Effect::Analog(i, v) => ui.analog[i] = v,
+            Effect::MasterBegin => ui.master.begin(params.master.value()),
+            Effect::MasterEnd => ui.master.end(),
+            Effect::MasterDelta(delta) => {
+                ui.turning[7] = 10;
+                let value = ui.master.adjust(params.master.value(), delta);
+                setter.set_parameter(&params.master, value);
+                continue;
+            }
+            _ => {}
+        }
+        send_effect(params, link, setter, ui.board == Board::Smk37, effect);
+    }
+}
+
+pub(super) fn send_effect(params: &Fm1Params, link: &Link, setter: &ParamSetter, smk: bool, effect: Effect) {
+    let cmd = match effect {
+        Effect::Key(id, down) => Some(Cmd::Key { id, down }),
+        Effect::KeyVelocity(v) => Some(Cmd::KeyVel(v)),
+        Effect::Pressure(id, vel) => Some(Cmd::Pressure { id, vel }),
+        Effect::Velocity(f) => { velocity(link, f); None }
+        Effect::Turn(i, clicks) => Some(Cmd::Enc { enc: if smk { i as u8 } else { panel::ENCS[i].1 }, clicks }),
+        Effect::Analog(idx, value) => Some(Cmd::Analog { idx: idx as u8, value }),
+        Effect::MasterBegin => { setter.begin_set_parameter(&params.master); None }
+        Effect::MasterDelta(_) => None, // resolved against the UI's gesture-local value above
+        Effect::MasterEnd => { setter.end_set_parameter(&params.master); None }
+    };
+    if let Some(cmd) = cmd { let _ = link.cmds.send(cmd); }
 }
 
 /// Ask for a package. The dialog runs modally, so not from inside the window's frame: macOS
@@ -436,44 +455,7 @@ fn file_job(action: FileAction, mut path: std::path::PathBuf, params: Arc<Fm1Par
     job
 }
 
-/// fm1-web's `panel_hit` codes: -1 nothing, 0..6 an encoder (FM-1; SMK-37 0..7 K1..K8), 7 the
-/// FM-1's pot, 100 + id a button or key, SMK-37: 200 + p a pad, 300 + f a fader, 400 / 401 the
-/// pitch / mod wheel.
-fn hit(smk: bool, x: f32, y: f32) -> i32 {
-    if smk {
-        return match panel_smk::hit(x, y) {
-            Some(panel_smk::Ctl::Enc(i)) => i as i32,
-            Some(panel_smk::Ctl::Btn(id)) | Some(panel_smk::Ctl::Key(id, _)) => 100 + id as i32,
-            Some(panel_smk::Ctl::Pad(p)) => 200 + p as i32,
-            Some(panel_smk::Ctl::Fader(f)) => 300 + f as i32,
-            Some(panel_smk::Ctl::Pitch) => 400,
-            Some(panel_smk::Ctl::Mod) => 401,
-            None => -1,
-        };
-    }
-    match panel::hit(x, y) {
-        Some(panel::Ctl::Enc(i)) => i as i32,
-        Some(panel::Ctl::Pot) => 7,
-        Some(panel::Ctl::Btn(id)) | Some(panel::Ctl::Key(id)) => 100 + id as i32,
-        None => -1,
-    }
-}
-
-/// How far down a key the SMK-37's panel was hit (0 top .. 1 bottom).
-fn panel_smk_hit_y(x: f32, y: f32) -> f32 {
-    match panel_smk::hit(x, y) {
-        Some(panel_smk::Ctl::Key(_, f)) => f,
-        _ => 0.5,
-    }
-}
-
-fn key(ui: &mut Ui, link: &Link, id: i32, down: bool) {
-    if !(0..64).contains(&id) || ui.down[id as usize] == down {
-        return;
-    }
-    ui.down[id as usize] = down;
-    let _ = link.cmds.send(Cmd::Key { id: id as u8, down });
-}
+use crate::panel_input::hit;
 
 fn turn(ui: &mut Ui, link: &Link, smk: bool, i: i32, clicks: i32) {
     ui.enc_clicks[i as usize] += clicks;
@@ -489,21 +471,33 @@ fn analog(ui: &mut Ui, link: &Link, i: usize, v: u16) {
     }
 }
 
-/// SMK-37: a pad pressed, a fader or a wheel dragged.
-fn slide(ui: &mut Ui, link: &Link, ctl: i32, y: f32) {
-    if ctl < 300 {
-        analog(ui, link, (ctl - 200) as usize, 700);
-    } else if ctl < 400 {
-        let f = (ctl - 300) as usize;
-        analog(ui, link, 16 + f, panel_smk::fader_value(f, y));
-    } else {
-        let pitch = ctl == 400;
-        analog(ui, link, if pitch { 20 } else { 21 }, panel_smk::wheel_value(pitch, y));
-    }
-}
-
 /// SMK-37: the next keys' velocity, from how far down the key was hit (fm1-web's curve).
 fn velocity(link: &Link, f: f32) {
     let us = (80000f32.ln() + (2000f32.ln() - 80000f32.ln()) * f.clamp(0.0, 1.0)).exp();
     let _ = link.cmds.send(Cmd::Vel(us as u32));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_ends_old_master_gesture_and_releases_transient_controls() {
+        let mut ui = Ui::default();
+        ui.master.begin(0.2);
+        ui.master.adjust(0.2, 0.1);
+        ui.down[21] = true;
+        ui.analog[0] = 700;
+        ui.analog[16] = 321;
+        ui.analog[fm1_soc::smk::ANALOG_MOD as usize] = 456;
+        ui.analog[fm1_soc::smk::ANALOG_PITCH as usize] = 900;
+        // The host closes during a drag, automates master while closed, and reopens.
+        ui.reopen();
+        assert!((ui.master.adjust(0.8, 0.1) - 0.9).abs() < 0.00001);
+        assert!(ui.down.iter().all(|down| !down));
+        assert!(ui.analog[..16].iter().all(|force| *force == 0));
+        assert_eq!(ui.analog[fm1_soc::smk::ANALOG_PITCH as usize], fm1_soc::smk::PITCH_REST);
+        assert_eq!(ui.analog[16], 321);
+        assert_eq!(ui.analog[fm1_soc::smk::ANALOG_MOD as usize], 456);
+    }
 }

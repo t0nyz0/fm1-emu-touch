@@ -1,0 +1,47 @@
+name: Native touch regression tests
+
+on:
+  push:
+    branches: [macos-direct-touch]
+  pull_request:
+    paths:
+      - 'crates/fm1-touch/**'
+      - 'crates/fm1-live/**'
+      - 'crates/fm1-plugin/**'
+      - 'Cargo.*'
+      - '.github/workflows/touch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libasound2-dev pkg-config
+      - name: Contact state and native build regressions
+        run: cargo test --locked -p fm1-touch -p fm1-live
+      - if: runner.os == 'macOS'
+        name: AppKit identity and attachment lifecycle
+        run: sh crates/fm1-touch/tests/run-macos-harness.sh
+
+  plugin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Engine test fixture
+        run: node tools/fetch_firmwares.mjs felucca
+      - name: Editor contact state and engine regressions
+        run: cargo test --locked --manifest-path crates/fm1-plugin/Cargo.toml

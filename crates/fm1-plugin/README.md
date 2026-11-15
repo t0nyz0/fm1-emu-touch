@@ -4,6 +4,10 @@ The emulator as an instrument in a DAW: load a firmware package (`.fwsc`) or a s
 window, play it from the host's MIDI, and play its panel with the mouse. It's the same panel as
 on the page, so an SMK-37 package gets the SMK-37's.
 
+This fork also adds independent direct touchscreen contacts to the instrument
+panel on macOS 27 and later. See [touchscreen implementation and validation](../../docs/TOUCHSCREEN.md)
+for the native API, build checks and physical-screen/DAW acceptance still needed.
+
 | Format | For | Built by |
 |---|---|---|
 | AU (v2) | Logic, GarageBand, and other Mac hosts | clap-wrapper |
@@ -154,6 +158,11 @@ Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` t
   - a key or button is held while pressed, and a drag across the keys plays a glissando;
   - a knob turns when you drag it up or down, or scroll over it;
   - on the SMK-37 the pads, faders and wheels work too.
+  On macOS 27, an AppKit direct-touch recognizer tracks separate screen contacts for
+  chords and simultaneous controls. Mouse input has its own contact, and shared keys
+  and pads release when their final contact ends. See [touchscreen support and the
+  hardware verification checklist](../../docs/TOUCHSCREEN.md); physical-screen and
+  DAW gesture arbitration still need validation on the touchscreen hardware.
 - **Record** writes the FM-1's output to a WAV (44.1 kHz, 16-bit) in your Music folder's
   `fm1-emu`, until you press Stop.
 - **The status bar** shows the emulation's speed against real time, and counts the frames that

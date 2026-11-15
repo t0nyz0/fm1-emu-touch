@@ -602,6 +602,7 @@ dependencies = [
  "cpal",
  "fm1-core",
  "fm1-soc",
+ "fm1-touch",
  "midir",
  "minifb",
  "rfd",
@@ -613,6 +614,13 @@ name = "fm1-soc"
 version = "0.5.1"
 dependencies = [
  "fm1-core",
+]
+
+[[package]]
+name = "fm1-touch"
+version = "0.5.1"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
