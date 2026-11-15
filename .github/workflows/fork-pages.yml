@@ -1,0 +1,79 @@
+# Tony's fork publishes the touchscreen branch without changing upstream's release workflow.
+name: Fork web app
+
+on:
+  push:
+    branches: [macos-direct-touch]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 't0nyz0/fm1-emu-touch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.100.0'
+          targets: wasm32-unknown-unknown
+      - name: Emulator unit tests
+        run: cargo test --release --locked -p fm1-isa -p fm1-core -p fm1-soc -p fm1-web
+      - name: Browser regression tests
+        run: node --test web/*.test.mjs
+      - name: Firmware table
+        run: node tools/readme_firmwares.mjs --check
+      - name: Build full site
+        run: tools/build_site.sh _site
+      - name: FM-1 firmware, screen and MIDI smoke test
+        run: node web/smoke.mjs _site
+      - name: WASM save round trip
+        run: node web/persistence.wasm.mjs _site
+      - name: SMK-37 firmware and key smoke test
+        run: node web/smoke_smk37.mjs _site
+      - name: SID player smoke test
+        run: node fm1-sid/web/smoke.mjs _site/fm1-sid
+      - name: Publish attribution and exact build identity
+        run: |
+          cp LICENSE _site/LICENSE.txt
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('_site/build.json').write_text(json.dumps({
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'commit': os.environ['GITHUB_SHA'],
+              'ref': os.environ['GITHUB_REF_NAME'],
+          }, indent=2) + '\n')
+          PY
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    if: github.repository == 't0nyz0/fm1-emu-touch' && github.ref == 'refs/heads/macos-direct-touch'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy fork web app
+        id: deployment
+        uses: actions/deploy-pages@v4

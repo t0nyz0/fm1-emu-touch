@@ -9,15 +9,24 @@ class Element {
   constructor(text = '', value = '') {
     this.text = this.textContent = text; this.value = String(value); this.options = []; this.listeners = {};
     this.dataset = {}; this.style = { setProperty() {} }; this.classList = { add() {}, remove() {}, toggle() {} };
-    this.parentElement = this;
+    this.parentElement = this; this.tagName = 'DIV'; this.captures = new Set();
   }
-  add(e, at = this.options.length) { this.options.splice(at, 0, e); }
+  add(e, at = this.options.length) { e.optionOwner = this; this.options.splice(at, 0, e); }
+  remove() { if (this.optionOwner) this.optionOwner.options.splice(this.optionOwner.options.indexOf(this), 1); }
   addEventListener(type, fn) { this.listeners[type] = fn; }
   append() {} replaceChildren() {} setAttribute() {} blur() {} click() {}
   hasAttribute() { return false; }
   querySelector() { return new Element(); }
-  getBoundingClientRect() { return { top: 0 }; }
+  getBoundingClientRect() { return { top: 0, left: 0, width: 100, height: 100 }; }
   getContext() { return {}; }
+  setPointerCapture(id) { if (this.captureError) throw new Error('inactive pointer'); this.captures.add(id); }
+  hasPointerCapture(id) { return this.captures.has(id); }
+  releasePointerCapture(id) { this.captures.delete(id); this.listeners.lostpointercapture?.({ pointerId: id }); }
+  dispatch(type, fields = {}) {
+    const event = { target: this, preventDefault() { this.defaultPrevented = true; }, ...fields };
+    this.listeners[type]?.(event);
+    return event;
+  }
 }
 function storage() {
   return { records: new Map(), entries: new Map(), writes: [], fail: false,
@@ -37,10 +46,12 @@ function storage() {
 }
 async function page(disk = storage(), initialSearch = '', selected = '', manualBootTimeout = false, extra = {}) {
   let bootTimer;
-  const elements = new Map();
+  const elements = new Map(), windowListeners = {}, documentListeners = {};
   const document = { documentElement: new Element(),
     getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
-    createElement() { return new Element(); }, querySelector() { return new Element(); }, addEventListener() {} };
+    createElement() { return new Element(); }, querySelector() { return new Element(); },
+    addEventListener(type, fn) { documentListeners[type] = fn; } };
+  if (extra.board === 1) document.documentElement.dataset.device = 'smk37';
   const cat = { default: 'a', firmwares: ['a', 'b'].map(id => ({ id, name: id, version: '1',
     package: `https://example.test/${id}.fwsc`, author: 'test', license: 'MIT', about: '' })) };
   let audio;
@@ -50,7 +61,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
   }
   class AudioWorkletNode {
     constructor() {
-      audio = this; this.messages = [];
+      audio = this; this.messages = []; this.board = extra.board || 0;
       this.port = { postMessage: message => {
         this.messages.push(message);
         queueMicrotask(() => {
@@ -62,7 +73,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
             const packed = new Uint8Array(message.sectors), view = new DataView(packed.buffer);
             for (let o = 0; o < packed.length; o += 4100) this.flash.set(packed.subarray(o + 4, o + 4100), view.getUint32(o, true));
             if (message.syx) this.flash.set(new Uint8Array(message.syx), 0x90000);
-            this.port.onmessage({ data: { type: 'booted', seq: this.seq, base: this.base, flash: this.flash.slice(), board: 0 } });
+            this.port.onmessage({ data: { type: 'booted', seq: this.seq, base: this.base, flash: this.flash.slice(), board: this.board } });
           } else if (message.type === 'snapshot') {
             this.port.onmessage({ data: { type: 'snapshot', seq: this.seq, request: message.request, flash: this.flash.slice() } });
           }
@@ -78,11 +89,12 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
     clearTimeout(id) { if (id !== 'boot-timer') clearTimeout(id); },
     document, location, history: { replaceState(_a, _b, url) { location.search = url; } },
     localStorage: { getItem: key => local.get(key), setItem: (key, value) => local.set(key, value) },
-    ResizeObserver: class { observe() {} }, scrollY: 0, Option: Element, navigator: {},
+    ResizeObserver: class { observe() {} }, scrollY: 0, Option: Element, navigator: {}, HTMLSelectElement: class extends Element {},
     fetch: async url => ({ json: async () => url === 'smk37/firmwares.json' ? { firmwares: [] } : cat,
       arrayBuffer: async () => new ArrayBuffer(0) }),
-    WebAssembly: { instantiate: async () => ({ instance: { exports: { panel_board() {}, panel_width: () => 100, panel_height: () => 100, panel_theme_count: () => 1, panel_theme_name: () => 0, panel_theme() {}, memory: { buffer: new ArrayBuffer(256) } } } }) },
-    requestAnimationFrame() {}, addEventListener() {}, AudioContext, AudioWorkletNode,
+    WebAssembly: { instantiate: async () => ({ instance: { exports: { panel_board() {}, panel_width: () => 100, panel_height: () => 100, panel_theme_count: () => 1, panel_theme_name: () => 0, panel_theme() {}, panel_hit: () => -1, panel_hit_y: () => 0.5, panel_enc_id: i => i, panel_slide: (_i, y) => y,
+      memory: { buffer: new ArrayBuffer(256) }, ...extra.panelExports } } }) },
+    requestAnimationFrame() {}, addEventListener(type, fn) { windowListeners[type] = fn; }, AudioContext, AudioWorkletNode,
     matchMedia: () => ({ matches: false }), confirm: () => true,
     fetchPackage: async f => ({ bytes: new Uint8Array(960).fill(f.id === 'a' ? 1 : 2), url: f.package }),
     hubNewcomers: async () => [], hubCardUrl: id => `https://thefirmwarehub.com/#fw-${id}`,
@@ -91,10 +103,17 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
   const run = new Function(...Object.keys(environment), `return (async () => { ${source}\nreturn {
     startAudio, boot, flushRunning, setLatency, get running() { return running; },
     setFirmware(id) { fw = byId.get(id); fwSel.value = id; }, setBank(bytes) { bank = bytes; },
-    get fw() { return fw; }, perf, setMhz(c) { mhz = c; }, get bootSeq() { return bootSeq; }
+    get fw() { return fw; }, perf, setMhz(c) { mhz = c; }, get bootSeq() { return bootSeq; }, midiMessage
   }; })()`);
   const api = await run(...Object.values(environment));
-  return { api, disk, elements, location, expireBoot: () => bootTimer(), get audio() { return audio; } };
+  const dispatch = (listeners, type, fields) => {
+    const event = { target: new Element(), preventDefault() { this.defaultPrevented = true; }, ...fields };
+    listeners[type]?.(event); return event;
+  };
+  return { api, disk, elements, location, document, expireBoot: () => bootTimer(), get audio() { return audio; },
+    fireWindow: (type, fields = {}) => dispatch(windowListeners, type, fields),
+    fireDocument: (type, fields = {}) => dispatch(documentListeners, type, fields) };
+
 }
 test('firmware switch, clock reboot and audio-context replacement retain the latest flash', async () => {
   const p = await page(); await p.api.startAudio(); await p.api.boot(); await settle();
@@ -312,4 +331,162 @@ test('?package= plays a package from a link, named by &name=, and a reload fetch
   // not https: ignored, the page as without it
   const r = await page(storage(), '?package=http%3A%2F%2Fexample.test%2Fx.fwsc');
   assert.equal(r.api.fw.id, 'a');
+});
+
+// Dispatch the page's real registered handlers; the small hit map isolates input ownership
+// from the Rust panel geometry. CSS / physical Safari gesture arbitration needs hardware QA.
+async function inputPage(board = 0, extra = {}) {
+  const p = await page(storage(), '', '', false, { ...extra, board, panelExports: {
+    panel_hit: (x, y) => {
+      if (y >= 50 && y < 90 && x >= 0 && x < 40) return (board ? 112 : 121) + Math.floor(x / 20);
+      if (y >= 10 && y < 30) {
+        if (x < 20) return board ? 200 : 0;
+        if (x < 40) return board ? 400 : 1;
+        if (x < 60) return board ? 300 : 7;
+      }
+      return -1;
+    }, panel_slide: (_i, y) => Math.round(y * 10),
+  } });
+  await p.api.startAudio(); await p.api.boot(); await settle();
+  p.audio.messages.length = 0;
+  p.panel = p.elements.get('panel');
+  p.pointer = (type, id, x = 10, y = 60, fields = {}) => p.panel.dispatch(type,
+    { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, button: 0, buttons: 1, ...fields });
+  p.key = (type, key = 'a', code = 'KeyA', fields = {}) => p.fireWindow(type, { key, code, repeat: false, ...fields });
+  p.keys = () => p.audio.messages.filter(m => m.type === 'key').map(m => [m.id, m.down]);
+  return p;
+}
+
+test('screen contacts and computer keys share note ownership in either release order', async () => {
+  const p = await inputPage();
+  p.pointer('pointerdown', 1); p.pointer('pointerdown', 2, 30); p.key('keydown');
+  p.key('keyup');
+  assert.deepEqual(p.keys(), [[21, true], [22, true]], 'keyboard release must retain the touched key');
+  p.pointer('pointerup', 1); p.pointer('pointercancel', 2);
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false], [22, false]]);
+  p.audio.messages.length = 0;
+  p.key('keydown'); p.pointer('pointerdown', 3); p.pointer('pointerup', 3);
+  assert.deepEqual(p.keys(), [[21, true]], 'touch release must retain the computer key');
+  p.key('keyup', 'A');
+  assert.deepEqual(p.keys(), [[21, true], [21, false]], 'physical key identity survives a shift change');
+});
+
+test('glissando releases outside the keybed and reenters while another finger holds a chord', async () => {
+  const p = await inputPage();
+  p.pointer('pointerdown', 1); p.pointer('pointerdown', 2, 30);
+  p.pointer('pointermove', 1, 30); p.pointer('pointermove', 1, 90, 90);
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false]], 'second finger retains the shared note');
+  p.pointer('pointerup', 2);
+  assert.deepEqual(p.keys().at(-1), [22, false], 'finger outside keys holds no note');
+  p.pointer('pointermove', 1, 10, 60);
+  assert.deepEqual(p.keys().at(-1), [21, true]);
+  p.pointer('lostpointercapture', 1); p.pointer('pointerup', 1);
+  assert.deepEqual(p.keys().slice(-2), [[21, true], [21, false]], 'capture loss and up release once');
+});
+
+test('pads share touch and keyboard ownership; pitch cancellation springs back', async () => {
+  const p = await inputPage(1);
+  p.pointer('pointerdown', 1, 10, 20); p.pointer('pointerdown', 2, 10, 20); p.key('keydown', '1', 'Digit1');
+  p.pointer('pointerup', 1); p.key('keyup', '1', 'Digit1');
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'analog' && m.idx === 0).map(m => m.value), [700]);
+  p.pointer('pointercancel', 2);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'analog' && m.idx === 0).map(m => m.value), [700, 0]);
+  p.pointer('pointerdown', 3, 30, 20); p.pointer('pointermove', 3, 30, 25); p.pointer('pointercancel', 3);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'analog' && m.idx === 20).map(m => m.value), [200, 250, 535]);
+});
+
+test('independent screen knobs retain separate drag accumulators and reject secondary mouse buttons', async () => {
+  const p = await inputPage();
+  p.pointer('pointerdown', 1, 10, 20); p.pointer('pointerdown', 2, 30, 20, { isPrimary: false });
+  p.pointer('pointermove', 1, 10, 8); p.pointer('pointermove', 2, 30, 44);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'enc').map(m => [m.enc, m.clicks]), [[0, 1], [1, -1], [1, -1]]);
+  p.pointer('pointerdown', 3, 10, 60, { pointerType: 'mouse', button: 2, buttons: 2 });
+  assert.deepEqual(p.keys(), []);
+  assert.equal(p.panel.dispatch('contextmenu').defaultPrevented, true);
+});
+
+test('capture failure has window release fallback and duplicate pointer ids never leak holds', async () => {
+  const p = await inputPage();
+  p.panel.captureError = true;
+  assert.doesNotThrow(() => p.pointer('pointerdown', 1));
+  p.fireWindow('pointerup', { pointerId: 1 });
+  assert.deepEqual(p.keys(), [[21, true], [21, false]]);
+  p.panel.captureError = false; p.audio.messages.length = 0;
+  p.pointer('pointerdown', 2); p.pointer('pointerdown', 2, 30); p.pointer('pointerup', 2);
+  assert.deepEqual(p.keys(), [[21, true], [21, false], [22, true], [22, false]]);
+  assert.equal(p.panel.captures.size, 0);
+});
+
+test('blur, hiding, page exit and firmware reboot release local contacts and captured pointers', async () => {
+  for (const reason of ['blur', 'visibilitychange', 'pagehide', 'boot']) {
+    const p = await inputPage(1);
+    p.pointer('pointerdown', 1); p.key('keydown'); p.pointer('pointerdown', 2, 10, 20); p.pointer('pointerdown', 3, 30, 20);
+    if (reason === 'visibilitychange') { p.document.visibilityState = 'hidden'; p.fireDocument(reason); }
+    else if (reason === 'boot') await p.api.boot();
+    else p.fireWindow(reason);
+    assert.deepEqual(p.keys(), [[12, true], [12, false]], reason);
+    assert.equal(p.panel.captures.size, 0, reason);
+    assert.ok(p.audio.messages.some(m => m.type === 'analog' && m.idx === 0 && m.value === 0), reason);
+    assert.ok(p.audio.messages.some(m => m.type === 'analog' && m.idx === 20 && m.value === 535), reason);
+    p.audio.messages.length = 0;
+    p.pointer('pointerup', 1); p.key('keyup'); p.pointer('pointermove', 3, 30, 25);
+    assert.deepEqual(p.audio.messages, [], 'stale input after lifecycle reset is ignored');
+    await settle();
+  }
+});
+
+test('SMK MIDI notes retain ownership across local touch and keyboard release', async () => {
+  const p = await inputPage(1), target = { id: 'keyboard' };
+  p.api.midiMessage({ target, data: [0x90, 60, 100] });
+  p.pointer('pointerdown', 1); p.key('keydown'); p.pointer('pointerup', 1); p.key('keyup');
+  assert.deepEqual(p.keys(), [[12, true]]);
+  p.fireWindow('blur');
+  assert.deepEqual(p.keys(), [[12, true]], 'background MIDI stays playable');
+  p.api.midiMessage({ target, data: [0x80, 60, 0] });
+  assert.deepEqual(p.keys(), [[12, true], [12, false]]);
+});
+
+test('SMK MIDI owners follow physical channels across channel selector changes', async () => {
+  const p = await inputPage(1), target = { id: 'keyboard' };
+  p.api.midiMessage({ target, data: [0x90, 60, 100] });
+  const channel = p.elements.get('midich');
+  channel.value = '2'; channel.listeners.change();
+  p.api.midiMessage({ target, data: [0x80, 60, 0] });
+  assert.deepEqual(p.keys(), [[12, true], [12, false]]);
+});
+
+test('deselected and disconnected SMK MIDI inputs release only their own held notes', async () => {
+  const input = { id: 'keyboard', name: 'Keyboard', state: 'connected' };
+  const access = { inputs: new Map([[input.id, input]]) };
+  const p = await inputPage(1, { navigator: { requestMIDIAccess: async () => access } });
+  const select = p.elements.get('midi');
+  select.value = '*'; select.listeners.change(); await settle();
+  input.onmidimessage({ target: input, data: [0x90, 60, 100] });
+  p.pointer('pointerdown', 1);
+  select.value = ''; select.listeners.change();
+  assert.equal(input.onmidimessage, null);
+  assert.deepEqual(p.keys(), [[12, true]], 'deselecting MIDI retains the touched key');
+  p.pointer('pointerup', 1);
+  assert.deepEqual(p.keys().at(-1), [12, false]);
+  select.value = '*'; select.listeners.change(); await settle();
+  input.onmidimessage({ target: input, data: [0x90, 60, 100] });
+  access.inputs.delete(input.id); access.onstatechange();
+  assert.deepEqual(p.keys().slice(-2), [[12, true], [12, false]], 'disconnection releases its MIDI note');
+});
+
+test('input during a pending firmware boot cannot leave invisible held controls', async () => {
+  const p = await inputPage();
+  p.audio.hangBoot = true;
+  const sent = p.audio.messages.length, booting = p.api.boot();
+  while (!p.audio.messages.slice(sent).some(m => m.type === 'boot')) await settle();
+  p.pointer('pointerdown', 1); p.key('keydown');
+  const keys = p.keys(), captures = p.panel.captures.size;
+  p.audio.hangBoot = false;
+  p.audio.port.onmessage({ data: { type: 'booted', seq: p.api.bootSeq, base: p.audio.base, flash: p.audio.flash.slice(), board: 0 } });
+  await booting;
+  assert.deepEqual(keys, []);
+  assert.equal(captures, 0);
+  p.audio.messages.length = 0;
+  p.pointer('pointerup', 1); p.key('keyup');
+  assert.deepEqual(p.audio.messages, []);
 });

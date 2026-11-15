@@ -1,11 +1,14 @@
-# FM-1 emulator
+# fm1-emu-touch
 
-This is [Tony's fork](https://github.com/t0nyz0/fm1-emu) of
+This is [Tony's fork](https://github.com/t0nyz0/fm1-emu-touch) of
 [joakimeriksson/fm1-emu](https://github.com/joakimeriksson/fm1-emu), adding native
 macOS 27 direct touchscreen input for the PROLED XDR MacBook Pro. See
 [touchscreen implementation and validation](docs/TOUCHSCREEN.md) for scope,
 build instructions and the remaining physical-device checks. The demo and
 release links below still point to the original project.
+
+**Our browser version: [t0nyz0.github.io/fm1-emu-touch](https://t0nyz0.github.io/fm1-emu-touch/)**.
+The `macos-direct-touch` branch publishes this site through the fork's Pages workflow.
 
 The **M-VAVE FM-1** is a pocket FM synthesizer, and a small community writes its own firmwares
 for it: drum machines, grooveboxes, ambient generators, a chord harp. This project emulates the

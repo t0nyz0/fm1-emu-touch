@@ -8,8 +8,8 @@
 <meta property="og:type" content="website">
 <meta property="og:title" content="SMK-37 Emulator">
 <meta property="og:description" content="The M-VAVE SMK-37 keyboard emulated in the browser, running the community firmwares ported to it from the FM-1: the same chip, its keys, pads, faders, wheels and screen in WebAssembly.">
-<meta property="og:url" content="https://joakimeriksson.github.io/fm1-emu/smk37/">
-<meta property="og:image" content="https://joakimeriksson.github.io/fm1-emu/smk37/og.png">
+<meta property="og:url" content="https://t0nyz0.github.io/fm1-emu-touch/smk37/">
+<meta property="og:image" content="https://t0nyz0.github.io/fm1-emu-touch/smk37/og.png">
 <meta property="og:image:width" content="1280">
 <meta property="og:image:height" content="640">
 <meta property="og:image:alt" content="The emulated SMK-37 with its 37 keys, 16 RGB pads, faders and wheels, running a community firmware">
@@ -25,12 +25,13 @@
     <!-- release:pill --><a class="ver" href="https://github.com/joakimeriksson/fm1-emu/releases/tag/v0.5.1" title="Release notes and downloads for 0.5.1">v0.5.1</a><!-- /release:pill -->
     <nav class="devices" aria-label="Device"><a href="../">FM-1</a><span aria-current="page">SMK-37</span></nav>
     <nav class="sitenav" aria-label="Site">
-      <a href="#firmwares">Firmwares</a><a href="#guide">Guide</a><a href="#plugin">DAW plugin</a><a href="https://github.com/joakimeriksson/fm1-emu#readme">Docs</a>
+      <a href="#firmwares">Firmwares</a><a href="#guide">Guide</a><a href="#plugin">DAW plugin</a><a href="https://github.com/t0nyz0/fm1-emu-touch/blob/macos-direct-touch/README.md">Docs</a>
     </nav>
-    <a class="gh" href="https://github.com/joakimeriksson/fm1-emu" aria-label="Source code on GitHub"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span><span class="arrow" aria-hidden="true">↗</span></a>
+    <a class="gh" href="https://github.com/t0nyz0/fm1-emu-touch/tree/macos-direct-touch" aria-label="Source code on GitHub"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg><span>GitHub</span><span class="arrow" aria-hidden="true">↗</span></a>
     <a class="embed-only" id="fullpage" href="./" target="_blank" rel="noopener">SMK-37 emulator, full page ↗</a>
   </div>
 </header>
+  <p class="wrap fork-note">Tony’s touchscreen fork · <a href="https://github.com/t0nyz0/fm1-emu-touch/tree/macos-direct-touch">Source</a> · based on <a href="https://github.com/joakimeriksson/fm1-emu">Joakim Eriksson’s emulator</a>. Download links below are the original project’s releases.</p>
 <main>
   <div class="player">
     <div class="deck">
@@ -43,7 +44,7 @@
         <div class="acts">
           <button type="button" id="perfwarn-fix" class="primary"></button>
           <button type="button" id="perfwarn-copy" title="A short text about this device and how it kept up, to paste into a bug report">Copy a report</button>
-          <a href="https://github.com/joakimeriksson/fm1-emu/issues/new" target="_blank" rel="noopener">Report on GitHub ↗</a>
+          <a href="https://github.com/t0nyz0/fm1-emu-touch/issues/new" target="_blank" rel="noopener">Report on GitHub ↗</a>
           <button type="button" id="perfwarn-close" aria-label="Dismiss">✕</button>
         </div>
       </div>
@@ -270,9 +271,9 @@
     </div>
     <div class="col">
       <b>Code</b>
-      <a href="https://github.com/joakimeriksson/fm1-emu">Source on GitHub ↗</a>
+      <a href="https://github.com/t0nyz0/fm1-emu-touch/tree/macos-direct-touch">Fork source on GitHub ↗</a>
       <a href="https://github.com/joakimeriksson/fm1-emu/releases/latest">DAW plugin download ↗</a>
-      <a href="https://github.com/joakimeriksson/fm1-emu/issues/new">Report an issue ↗</a>
+      <a href="https://github.com/t0nyz0/fm1-emu-touch/issues/new">Report an issue ↗</a>
     </div>
     <div class="col">
       <b>More</b>

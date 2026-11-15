@@ -127,6 +127,7 @@ analog[20] = PITCH_REST;
 analog[21] = MOD_REST;
 function setBoard(b) {
   if (b === board) return;
+  if (board !== -1) releaseInputs(true);
   board = b;
   ui.panel_board(b);
   W = ui.panel_width();
@@ -495,40 +496,86 @@ const at = (e) => {
   const r = canvas.getBoundingClientRect();
   return [(e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height)];
 };
-const holds = new Uint8Array(64);          // pointers holding each key / button
+const holds = new Uint32Array(64);         // all local / SMK MIDI owners of each key
 function press(id) { if (holds[id]++ === 0) setKey(id, true); }
 function unpress(id) { if (holds[id] && --holds[id] === 0) setKey(id, false); }
-const pointers = new Map();                // pointerId -> { grab, lastY, acc, held }
+const padHolds = new Uint32Array(16);
+function pressPad(id) { if (padHolds[id]++ === 0) setAnalog(id, 700); }
+function unpressPad(id) { if (padHolds[id] && --padHolds[id] === 0) setAnalog(id, 0); }
+const keyboard = new Map();                // physical key -> the control it began holding
+const midiKeys = new Map();                // SMK MIDI input / source channel / note -> { id, input }
+const pointers = new Map();                // pointerId -> { grab, lastY, acc, held, keyDrag }
+function releasePointer(id) {
+  const p = pointers.get(id);
+  if (!p) return;
+  pointers.delete(id);                     // capture loss may synchronously call us again
+  if (p.held >= 0) unpress(p.held);
+  if (board === 1 && p.grab >= 200 && p.grab < 216) unpressPad(p.grab - 200);
+  if (board === 1 && p.grab === 400) setAnalog(20, PITCH_REST);
+  try { if (canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id); } catch { /* already gone */ }
+}
+function releaseKeyboard(code) {
+  const held = keyboard.get(code);
+  if (!held) return;
+  keyboard.delete(code);
+  if (held.pad >= 0) unpressPad(held.pad);
+  else unpress(held.id);
+}
+function releaseInputs(includeMidi = false) {
+  for (const id of [...pointers.keys()]) releasePointer(id);
+  for (const code of [...keyboard.keys()]) releaseKeyboard(code);
+  if (includeMidi) {
+    for (const held of midiKeys.values()) unpress(held.id);
+    midiKeys.clear();
+    // A new machine must not inherit transient force from the previous panel.
+    for (let i = 0; i < 16; i++) setAnalog(i, 0);
+    setAnalog(20, PITCH_REST);
+  }
+}
 canvas.addEventListener("pointerdown", (e) => {
-  const [x, y] = at(e);
-  const p = { grab: ui.panel_hit(x, y), lastY: y, acc: 0, held: -1 };
+  if (booting) return;
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  e.preventDefault();
+  releasePointer(e.pointerId);
+  const [x, y] = at(e), grab = ui.panel_hit(x, y);
+  if (grab < 0) return;
+  // Momentary controls share ownership. A knob / slider keeps its first contact.
+  const shared = (grab >= 100 && grab < 200) || (board === 1 && grab >= 200 && grab < 216);
+  if (!shared && [...pointers.values()].some(p => p.grab === grab)) return;
+  const keys = board === 1 ? [0, NKEY] : [14, 41];
+  const p = { grab, lastY: y, acc: 0, held: -1, keyDrag: grab >= 100 + keys[0] && grab < 100 + keys[1] };
   pointers.set(e.pointerId, p);
-  canvas.setPointerCapture(e.pointerId);
+  // A pointer can cease being active before capture is established. Window-level
+  // move/up/cancel handlers and focus cleanup still finish that contact safely.
+  try { canvas.setPointerCapture(e.pointerId); } catch { /* use window fallback */ }
   if (p.grab >= 100 && p.grab < 200) {
     p.held = p.grab - 100;
-    // SMK-37: a key hit further down sounds harder
     if (board === 1 && p.held < NKEY) setVelocity(ui.panel_hit_y());
     press(p.held);
   } else if (board === 1 && p.grab >= 200) slide(p, y);
-});
-// SMK-37: a pad pressed (harder the lower it is hit), a fader or a wheel dragged
+}, { passive: false });
+// SMK-37: a pad pressed, a fader or a wheel dragged
 function slide(p, y) {
-  if (p.grab < 300) setAnalog(p.grab - 200, 700);
+  if (p.grab < 300) pressPad(p.grab - 200);
   else if (p.grab < 400) setAnalog(16 + p.grab - 300, ui.panel_slide(p.grab - 300, y));
   else setAnalog(p.grab === 400 ? 20 : 21, ui.panel_slide(p.grab === 400 ? 4 : 5, y));
 }
-canvas.addEventListener("pointermove", (e) => {
+function movePointer(e) {
   const p = pointers.get(e.pointerId);
-  if (!p || p.grab < 0) return;
+  if (!p) return;
+  if (e.pointerType === "mouse" && !(e.buttons & 1)) { releasePointer(e.pointerId); return; }
   const [x, y] = at(e);
   const keys = board === 1 ? [0, NKEY] : [14, 41];
-  if (p.grab >= 100 && p.grab < 200 && p.held >= keys[0] && p.held < keys[1]) {
-    const h = ui.panel_hit(x, y);              // glissando over the note keys
-    if (h >= 100 + keys[0] && h < 100 + keys[1] && h - 100 !== p.held) {
-      unpress(p.held);
-      p.held = h - 100;
-      if (board === 1) setVelocity(ui.panel_hit_y());
-      press(p.held);
+  if (p.keyDrag) {
+    const h = ui.panel_hit(x, y);
+    const held = h >= 100 + keys[0] && h < 100 + keys[1] ? h - 100 : -1;
+    if (held !== p.held) {
+      if (p.held >= 0) unpress(p.held);
+      p.held = held;
+      if (held >= 0) {
+        if (board === 1) setVelocity(ui.panel_hit_y());
+        press(held);
+      }
     }
   } else if (board === 1 && p.grab >= 300) {
     slide(p, y);
@@ -540,20 +587,17 @@ canvas.addEventListener("pointermove", (e) => {
     setPot(pot + (p.lastY - y) * 4);
   }
   p.lastY = y;
-});
-const release = (e) => {
-  const p = pointers.get(e.pointerId);
-  if (!p) return;
-  if (p.held >= 0) unpress(p.held);
-  if (board === 1 && p.grab >= 200 && p.grab < 216) setAnalog(p.grab - 200, 0);   // a pad let go
-  if (board === 1 && p.grab === 400) setAnalog(20, PITCH_REST);                   // the pitch wheel springs back
-  pointers.delete(e.pointerId);
-};
-canvas.addEventListener("pointerup", release);
-canvas.addEventListener("pointercancel", release);
-canvas.addEventListener("lostpointercapture", release);
+}
+canvas.addEventListener("pointermove", movePointer);
+addEventListener("pointermove", e => { if (e.target !== canvas) movePointer(e); });
+const release = e => releasePointer(e.pointerId);
+for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) canvas.addEventListener(type, release);
+for (const type of ["pointerup", "pointercancel"]) addEventListener(type, release);
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+addEventListener("blur", () => releaseInputs());
 let wheelAcc = 0;
 canvas.addEventListener("wheel", (e) => {
+  if (booting) return;
   const [x, y] = at(e);
   const h = ui.panel_hit(x, y);
   if (board === 1 && h >= 300 && h < 304) {          // SMK-37: a fader scrolled
@@ -586,23 +630,23 @@ function keyId(k) {
   return b === undefined ? -1 : b;
 }
 const padKey = (k) => (board === 1 && /^[1-8]$/.test(k) ? Number(k) - 1 : -1);
+const keyboardCode = e => e.code || e.key.toLowerCase();
 addEventListener("keydown", (e) => {
-  if (e.metaKey || e.ctrlKey || e.target instanceof HTMLSelectElement) return;
+  if (booting) return;
+  if (e.metaKey || e.ctrlKey || e.target?.isContentEditable || /^(SELECT|INPUT|TEXTAREA)$/.test(e.target?.tagName || "")) return;
   if (ENC_KEYS[e.key]) { e.preventDefault(); turn(...ENC_KEYS[e.key]); return; }
+  const code = keyboardCode(e);
+  if (e.repeat || keyboard.has(code)) return;
   const pad = padKey(e.key);
-  if (pad >= 0) { e.preventDefault(); if (!e.repeat) setAnalog(pad, 700); return; }
+  if (pad >= 0) { e.preventDefault(); keyboard.set(code, { pad }); pressPad(pad); return; }
   const id = keyId(e.key);
-  if (id < 0 || e.repeat) return;
+  if (id < 0) return;
   e.preventDefault();
+  keyboard.set(code, { id, pad: -1 });
   if (board === 1 && id < NKEY) setVelocity(0.75);
-  setKey(id, true);
+  press(id);
 });
-addEventListener("keyup", (e) => {
-  const pad = padKey(e.key);
-  if (pad >= 0) { setAnalog(pad, 0); return; }
-  const id = keyId(e.key);
-  if (id >= 0) setKey(id, false);
-});
+addEventListener("keyup", e => releaseKeyboard(keyboardCode(e)));
 
 // ---------------------------------------------------------------- MIDI in (Web MIDI)
 // The chosen input(s) play the synth through its MIDI IN jack (UART1 at 31250 baud in the
@@ -623,7 +667,7 @@ if (!navigator.requestMIDIAccess) {
 }
 function midiMessage(e) {
   const d = e.data;
-  if (!d.length || !node) return;
+  if (!d.length || !node || booting) return;
   const bytes = Array.from(d);
   if (midiCh && bytes[0] >= 0x80 && bytes[0] < 0xf0) bytes[0] = (bytes[0] & 0xf0) | (midiCh - 1);
   if (board === 1) {
@@ -632,8 +676,15 @@ function midiMessage(e) {
     const st = bytes[0] & 0xf0, k = bytes[1] - 48;
     if ((st === 0x90 || st === 0x80) && k >= 0 && k < NKEY) {
       const on = st === 0x90 && bytes[2] > 0;
-      if (on) setVelocity((bytes[2] - 1) / 126);
-      setKey(k, on);
+      const input = e.target?.id || "midi", owner = `${input}:${d[0] & 0x0f}:${d[1]}`;
+      if (on && !midiKeys.has(owner)) {
+        setVelocity((bytes[2] - 1) / 126);
+        midiKeys.set(owner, { id: k, input });
+        press(k);
+      } else if (!on && midiKeys.has(owner)) {
+        unpress(midiKeys.get(owner).id);
+        midiKeys.delete(owner);
+      }
     } else if (st === 0xe0) {
       const bend = ((bytes[2] << 7) | bytes[1]) - 8192;
       setAnalog(20, PITCH_REST + (bend >= 0 ? bend / 8191 * (640 - PITCH_REST) : bend / 8192 * (PITCH_REST - 445)));
@@ -657,8 +708,16 @@ function midiConnect() {
   for (const o of [...midiSel.options]) if (o.value !== "" && o.value !== "*" && !names.includes(o.value)) o.remove();
   for (const n of names) if (![...midiSel.options].some((o) => o.value === n)) midiSel.add(new Option(n, n));
   if ([...midiSel.options].some((o) => o.value === want)) midiSel.value = want;
-  for (const input of midi.inputs.values())
-    input.onmidimessage = want === "*" || want === input.name ? midiMessage : null;
+  const listening = new Set();
+  for (const input of midi.inputs.values()) {
+    const wanted = input.state !== "disconnected" && (want === "*" || want === input.name);
+    input.onmidimessage = wanted ? midiMessage : null;
+    if (wanted) listening.add(input.id);
+  }
+  for (const [owner, held] of midiKeys) if (!listening.has(held.input)) {
+    unpress(held.id);
+    midiKeys.delete(owner);
+  }
 }
 async function midiOpen() {
   if (midi || !navigator.requestMIDIAccess) return midiConnect();
@@ -918,6 +977,7 @@ async function flushRunning(pause = false) {
 // Serialize machine replacement, including the snapshot of the old machine. Requests that
 // became obsolete while downloading are skipped; every actual boot receives an acknowledgement.
 function boot(options = {}) {
+  releaseInputs(true);
   const seq = ++bootSeq, f = fw, clock = mhz;
   const task = async () => {
     if (seq !== bootSeq) return false;
@@ -955,7 +1015,8 @@ function boot(options = {}) {
       sessions.set(seq, session);
       loadedUrl = got.url;
       showFirmware();
-      down.fill(0); holds.fill(0); pointers.clear(); encClicks.fill(0);
+      releaseInputs(true);
+      down.fill(0); holds.fill(0); padHolds.fill(0); encClicks.fill(0);
       frame = last = null;
       booting = seq;
       perf.reset();
@@ -1186,12 +1247,16 @@ document.getElementById("update-firmware").addEventListener("click", action(asyn
   else saveMessage("Firmware ready: click Start");
 }));
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden" && running) flushRunning().catch(saveFailure);
+  if (document.visibilityState === "hidden") {
+    releaseInputs();
+    if (running) flushRunning().catch(saveFailure);
+  }
 });
 
 // Closing a tab is best effort: the browser may terminate the worklet before its reply.
 // Frequent quiet autosaves remain the durable fallback.
 addEventListener("pagehide", () => {
+  releaseInputs();
   if (running) flushRunning().catch(saveFailure);
 });
 

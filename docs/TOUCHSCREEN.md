@@ -14,6 +14,34 @@ with the origin at the top left, then mapped into the rendered panel by each
 frontend. Mouse, keyboard, MIDI and other platforms keep their existing input
 sources.
 
+## Browser version
+
+Play the fork at [t0nyz0.github.io/fm1-emu-touch](https://t0nyz0.github.io/fm1-emu-touch/).
+The fork's Pages workflow tests and builds FM-1, SMK-37 and the pinned SID player
+before deployment. `/build.json` identifies the exact published source commit.
+The original project's releases remain linked and clearly attributed separately
+from this fork's source.
+
+Safari uses the same Pointer Events path as other browsers. Connected Safari
+27.2 exposed `PointerEvent` and `touch-action: none`, while reporting
+`maxTouchPoints: 0` and no legacy `TouchEvent`; those reports are not used to
+disable input. No PROLED-specific JavaScript API or parallel legacy touch
+handlers are required by the documented browser API.
+
+Browser fixes cover shared keyboard/pointer ownership, independent contact and
+pad release, glissando outside and back into the keybed, unavailable pointer
+capture, secondary mouse buttons, and release on blur, hidden pages, page exit
+and firmware reboot. Browser tests dispatch independent contacts through the
+actual page handlers. Synthetic events validate state and DOM behavior; they do
+not establish physical finger delivery or operating-system gesture arbitration.
+
+The initial Safari 27.2 check booted Felucca through its actual AudioWorklet and
+passed eight synthetic DOM checks against the built page, including secondary
+contacts, shared keyboard ownership, glissando, knobs, capture failure and blur
+cleanup. Physical touchscreen and trusted pointer-capture delivery remain untested.
+
+## Native panels
+
 The contact state tracks each finger independently. Keys and buttons remain
 held until their last owner lets go, fingers can slide across keys, and each knob
 drag keeps its own accumulated movement. Pads and pitch wheels have release
@@ -44,7 +72,7 @@ sh crates/fm1-touch/tests/run-macos-harness.sh  # macOS; synthetic contacts, rea
 cargo test --locked -p fm1-isa -p fm1-core -p fm1-soc -p fm1-web
 node --test web/*.test.mjs
 node tools/fetch_firmwares.mjs felucca
-cargo test --locked --manifest-path crates/fm1-plugin/Cargo.toml
+CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true cargo test --release --locked --manifest-path crates/fm1-plugin/Cargo.toml
 NO_INSTALL=1 tools/build_plugin.sh
 ```
 

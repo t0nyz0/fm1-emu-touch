@@ -11,7 +11,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export const REPO = "https://github.com/joakimeriksson/fm1-emu";
-export const PAGE = "https://joakimeriksson.github.io/fm1-emu/";
+export const PAGE = "https://t0nyz0.github.io/fm1-emu-touch/";
+const ORIGINAL_PAGE = "https://joakimeriksson.github.io/fm1-emu/";
 const NOTES_BASE = `${REPO}/blob/master/docs/releases/`;
 
 export function workspaceVersion(cargoToml) {
@@ -55,7 +56,7 @@ export function parseNotes(md, version) {
   const lead = lines.slice(0, firstHeading < 0 ? lines.length : firstHeading).join("\n").trim().split(/\n\s*\n/)
     .find((p) => !p.startsWith("#")) || "";
   const leadMd = lead.replace(/\s+/g, " ").split(/(?<=\.)\s+(?=[A-Z*[])/)
-    .filter((s) => !s.includes(PAGE.replace(/^https:\/\//, "").replace(/\/$/, ""))).join(" ");
+    .filter((s) => ![PAGE, ORIGINAL_PAGE].some((page) => s.includes(page.replace(/^https:\/\//, "").replace(/\/$/, "")))).join(" ");
 
   // the downloads: `file` | what it is
   const downloads = [];

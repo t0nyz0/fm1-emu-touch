@@ -46,4 +46,8 @@ jobs:
           node tools/fetch_firmwares.mjs felucca
           test -s reference/firmwares/felucca.fwsc
       - name: Editor contact state and engine regressions
-        run: cargo test --locked --manifest-path crates/fm1-plugin/Cargo.toml
+        # The engine includes a real-time throughput assertion, as in plugin-tests.yml.
+        # Retain arithmetic checks so idle-reload regressions still fail in release.
+        env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: 'true'
+        run: cargo test --release --locked --manifest-path crates/fm1-plugin/Cargo.toml
