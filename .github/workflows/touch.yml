@@ -42,6 +42,8 @@ jobs:
         with:
           node-version: '22'
       - name: Engine test fixture
-        run: node tools/fetch_firmwares.mjs felucca
+        run: |
+          node tools/fetch_firmwares.mjs felucca
+          test -s reference/firmwares/felucca.fwsc
       - name: Editor contact state and engine regressions
         run: cargo test --locked --manifest-path crates/fm1-plugin/Cargo.toml

@@ -226,6 +226,10 @@ pub fn run(
                 Cmd::Boot { pkg, sectors } => {
                     cancel_snapshots(&mut pending);
                     m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz(), lcd_timed).ok());
+                    // A replacement machine starts its emulated clock at zero. Its idle
+                    // timing must never reuse the previous machine's clock reference.
+                    free = None;
+                    last_take = Instant::now();
                     active_pkg = m.as_ref().map(|_| pkg);
                     pot = u16::MAX;
                     let mut v = shared.view.lock().unwrap();
@@ -281,6 +285,8 @@ pub fn run(
                 let sectors = mm.changed_sectors();
                 if let Ok(next) = Machine::boot(pkg, &sectors, mhz, lcd_timed) {
                     m = Some(next);
+                    free = None;
+                    last_take = Instant::now();
                     pot = u16::MAX;
                     due.clear();
                     let mut v = shared.view.lock().unwrap();

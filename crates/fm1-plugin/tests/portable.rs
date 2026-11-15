@@ -1,7 +1,7 @@
 //! Shared saves boot through the real plugin engine, including same-firmware replacement.
 use fm1_plugin::{engine::{self, Cmd, Midi, Shared, View}, savefile::{self, SaveData}, Firmware, Fm1Params, Sector};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Engine {
     shared: Arc<Shared>,
@@ -35,6 +35,19 @@ impl Engine {
         let (tx, rx) = mpsc::channel();
         self.tx.send(Cmd::Snapshot { pkg: firmware.pkg.clone(), reply: tx }).unwrap();
         rx
+    }
+    fn wait_for_idle_free_run(&mut self) {
+        // Discard any silence queued before boot, then let this machine fill the ring.
+        // Its clock must advance before the idle reference is established.
+        for _ in 0..self._audio.slots() { let _ = self._audio.pop(); }
+        let lead = 1024 + self.params.lead.value().frames();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self._audio.slots() < lead {
+            assert!(Instant::now() < deadline, "firmware did not fill its audio lead");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The engine enters its idle path after 50 ms without an audio consumer.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 impl Drop for Engine {
@@ -96,4 +109,21 @@ fn a_firmware_change_cancels_a_pending_export() {
     assert!(pending.recv_timeout(Duration::from_secs(10)).unwrap().err().unwrap().contains("changed"));
     let wrong = Firmware { name: "wrong".into(), pkg: Arc::new(vec![0; 960]) };
     assert!(engine.snapshot(&wrong).recv_timeout(Duration::from_secs(10)).unwrap().is_err());
+}
+
+#[test]
+fn same_package_reload_after_idle_restarts_the_free_run_clock() {
+    let Some(mut data) = sample() else { return };
+    let mut engine = Engine::new();
+    engine.load(&data).unwrap();
+    engine.wait_for_idle_free_run();
+    data.sectors[0].data = Arc::new(vec![0x73; 4096]);
+    engine.load(&data).unwrap();
+    // A snapshot needs another 250 ms of engine service, including the new idle run.
+    let snapshot = engine.snapshot(&data.firmware).recv_timeout(Duration::from_secs(10));
+    engine.shared.quit.store(true, std::sync::atomic::Ordering::Relaxed);
+    let joined = engine.thread.take().unwrap().join();
+    assert!(joined.is_ok(), "engine failed after replacing an idle machine");
+    assert_eq!(byte(&snapshot.unwrap().unwrap()), 0x73);
+    assert!(!engine.shared.view.lock().unwrap().halted);
 }
