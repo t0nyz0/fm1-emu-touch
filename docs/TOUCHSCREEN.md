@@ -78,12 +78,44 @@ button through dragging and release. It also affects real right-clicks on that
 keybed; mouse emulation does not reliably identify the physical input device.
 Recording/transport buttons, pads and knobs are excluded from this fallback.
 
-The mode includes a bounded page-local input report. It records recent panel
-event types/buttons and processing state so a failed screen test can distinguish
-rejected secondary input, wheel-only input, missing pointer events and very
-short taps. It is not global input capture, and nothing is transmitted. Copying
-is explicit. These changes do not establish Firefox multitouch or guarantee
-that a screen gesture produces a playable press. Physical validation is pending.
+The mode includes an explicit Start/Stop page-local input capture. It keeps first
+and last press/release events separately from movement samples, counts every
+supported event type and accumulates wheel deltas by mode/modifier group. Stops
+freeze the report so later scrolling, copying or saving cannot replace the test.
+First/last event-origin coordinates, canvas/viewport mapping, input rejection
+state, emulation context and outgoing key-message counts help locate failures.
+These are browser event origins, not independent finger coordinates or a reliable
+physical-device identifier.
+
+Capture is scoped to this instrument's canvas, with owned-pointer release
+fallbacks. It is not global input capture, stores no typed keys and transmits
+nothing. Copy and JSON download are explicit actions. The latest physical test
+produced no sound from screen input in Firefox while trackpad clicks worked;
+its pasted twelve-row tail contained only wheel events at non-control hit
+locations. That tail cannot establish whether earlier press events occurred.
+Independent Firefox contacts remain unverified. No wheel-to-note inference is enabled.
+
+### Completed-tap timing
+
+Apple's generic mouse emulation can deliver a completed tap as adjacent down/up.
+The actual Felucca firmware and cached WebAssembly emulator produced silence
+when those two messages reached the worker at one simulated instant. A guarded
+20 ms emulated press produced the exact same audio samples as an explicitly
+held 20 ms reference, and the real key-up reached the emulator at that deadline.
+This is a controlled software regression, not a physical Firefox success claim.
+
+Only mouse-derived piano presses in the explicit compatibility mode request this
+minimum. Default mouse, true touch, keyboard, MIDI and transport controls keep
+their immediate behavior. The worker uses the firmware's simulated clock;
+cancellation, mode changes, pause and replacement flush deferred ups. A still
+held shared owner remains held. Extremely rapid re-taps within that minimum may
+merge, and normal firmware envelopes/reverb may continue after the key is up.
+
+The existing CI Felucca smoke check now executes the actual AudioWorklet with
+that package and compares guarded versus held-reference audio. It also checks
+unmarked same-cycle behavior and forced cancellation. No audio device is used.
+This fixes a demonstrable lost-tap path, while the integrated physical Firefox
+screen route still needs the frozen input capture.
 
 ## Native panels
 

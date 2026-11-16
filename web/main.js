@@ -7,6 +7,7 @@ import { fetchPackage, hubNewcomers, hubCardUrl } from "./fwsc.js";
 import { SaveStore, packageHash, changedSectors, packSectors, exportSave, importSave } from "./persistence.js";
 import { tryOutOf, loadTryOut } from "./tryout.js";
 import { createWheelControlNormalizer, createSafariPairEstimator } from "./gesture-input.js";
+import { createInputCapture } from "./input-capture.js";
 
 const CLOCKS = [60, 80, 100, 120, 160, 200, 240];
 // The device this page is for: the FM-1 (index.html) or the SMK-37 (smk37/index.html, <html
@@ -93,7 +94,11 @@ let screenCompatEnabled = params.get("screen") === "1";
 const screenCompatToggle = document.getElementById("screen-compat");
 const screenInputStatus = document.getElementById("screen-input-status");
 const screenInputReport = document.getElementById("screen-input-report");
-let screenEvents = [], lastScreenEvent = null, lastScreenTime = null;
+let inputCapture = null;
+let hasGuardedNoteInput = false;
+const screenCaptureStart = document.getElementById("screen-capture-start");
+const screenCaptureStop = document.getElementById("screen-capture-stop");
+const screenCaptureStatus = document.getElementById("screen-capture-status");
 const status = document.getElementById("status");
 const startBtn = document.getElementById("start");
 const fwSel = document.getElementById("fw");
@@ -483,10 +488,13 @@ requestAnimationFrame(draw);
 
 // ---------------------------------------------------------------- input to the machine
 const send = (m) => node && node.port.postMessage(m);
-function setKey(id, on) {
+function setKey(id, on, minHoldMs = 0) {
   if (down[id] === (on ? 1 : 0)) return;
   down[id] = on ? 1 : 0;
-  send({ type: "key", id, down: on });
+  if (node) inputCapture?.keyOutput(on);
+  const message = { type: "key", id, down: on };
+  if (on && minHoldMs > 0) { message.minHoldMs = minHoldMs; hasGuardedNoteInput = true; }
+  send(message);
 }
 function turn(i, clicks) {
   encClicks[i] += clicks;
@@ -520,7 +528,7 @@ const at = (e) => {
   return [(e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height)];
 };
 const holds = new Uint32Array(64);         // all local / SMK MIDI owners of each key
-function press(id) { if (holds[id]++ === 0) setKey(id, true); }
+function press(id, minHoldMs = 0) { if (holds[id]++ === 0) setKey(id, true, minHoldMs); }
 function unpress(id) { if (holds[id] && --holds[id] === 0) setKey(id, false); }
 const padHolds = new Uint32Array(16);
 function pressPad(id) { if (padHolds[id]++ === 0) setAnalog(id, 700); }
@@ -529,32 +537,49 @@ const keyboard = new Map();                // physical key -> the control it beg
 const midiKeys = new Map();                // SMK MIDI input / source channel / note -> { id, input }
 const pointers = new Map();                // pointerId -> { grab, lastY, acc, held, keyDrag }
 const pianoGrab = grab => grab >= (board === 1 ? 100 : 114) && grab < (board === 1 ? 137 : 141);
-function showScreenReport() {
-  if (!screenInputReport) return;
-  const text = JSON.stringify({ mode: "optional secondary-button piano input", events: screenEvents }, null, 2);
-  screenInputReport.textContent = text;
-  if (screenInputReport.tagName === "TEXTAREA") screenInputReport.value = text;
+function screenCaptureMapping() {
+  const r = canvas.getBoundingClientRect(), v = globalThis.visualViewport;
+  const n = value => typeof value === "number" && Number.isFinite(value) ? value : null;
+  return { canvasRect: { left: n(r.left), top: n(r.top), width: n(r.width), height: n(r.height) },
+    panelWidth: W, panelHeight: H, canvasWidth: n(canvas.width), canvasHeight: n(canvas.height), board,
+    dpr: n(globalThis.devicePixelRatio), scrollX: n(globalThis.scrollX), scrollY: n(globalThis.scrollY),
+    viewportWidth: n(globalThis.innerWidth), viewportHeight: n(globalThis.innerHeight),
+    visualViewport: v ? { offsetLeft: n(v.offsetLeft), offsetTop: n(v.offsetTop), width: n(v.width), height: n(v.height), scale: n(v.scale) } : null };
 }
-function recordScreenEvent(e) {
-  if (!screenCompatEnabled || e === lastScreenEvent || !["pointerdown", "pointerup", "pointercancel", "wheel"].includes(e.type)) return null;
-  lastScreenEvent = e;
-  const now = performance.now();
-  const record = { type: e.type, pointerType: ["mouse", "touch", "pen"].includes(e.pointerType) ? e.pointerType : null,
-    button: Number.isInteger(e.button) ? e.button : null, buttons: Number.isInteger(e.buttons) ? e.buttons : null,
-    timeMs: Math.round(now * 10) / 10, dtMs: lastScreenTime === null ? null : Math.round((now - lastScreenTime) * 10) / 10,
-    booting: !!booting, trialLockout: estimateClaimsPointers, reason: booting ? "booting" : estimateClaimsPointers ? "trial-lockout" : "received" };
-  lastScreenTime = now;
-  screenEvents.push(record);
-  if (screenEvents.length > 12) screenEvents.shift();
-  showScreenReport();
+function screenCaptureContext() {
+  const script = document.querySelector('script[src*="main.js"]')?.getAttribute?.("src") || "";
+  return { audioState: ac?.state || "not-created", running: !!running, booting: !!booting,
+    compatibility: screenCompatEnabled, trialLockout: estimateClaimsPointers,
+    inputMode: estimatesEnabled ? "safari-estimate" : screenCompatEnabled ? "secondary-compatibility" : "normal",
+    safariEstimateEnabled: estimatesEnabled, estimatorState: safariPair?.status || null,
+    build: script.match(/[?&]v=([\w.-]+)/)?.[1] || null };
+}
+inputCapture = createInputCapture({ getMapping: screenCaptureMapping, getContext: screenCaptureContext,
+  render(text, state) {
+    if (screenInputReport) {
+      screenInputReport.textContent = text;
+      if (screenInputReport.tagName === "TEXTAREA") screenInputReport.value = text;
+    }
+    if (screenCaptureStart) screenCaptureStart.disabled = state === "recording";
+    if (screenCaptureStop) screenCaptureStop.disabled = state !== "recording";
+    if (screenCaptureStatus) screenCaptureStatus.textContent = state === "recording"
+      ? "Recording this canvas only. Use the screen for the chosen action, then press Stop capture."
+      : state === "stopped" ? "Capture stopped. The report is frozen; copy or save it below."
+      : "Not recording. Press Start capture when the emulator is running.";
+  },
+});
+function showScreenReport() { inputCapture.flush(); }
+function recordScreenEvent(e, verifiedCanvasHit = false) {
+  if (e.target !== canvas && !verifiedCanvasHit) return null;
+  const record = inputCapture.record(e);
+  if (record) {
+    record.scopeBasis = e.target === canvas ? "canvas-target" : "verified-canvas-hit";
+    record.booting = !!booting; record.trialLockout = estimateClaimsPointers;
+    inputCapture.finish(record, booting ? "booting" : estimateClaimsPointers ? "trial-lockout" : "observed");
+  }
   return record;
 }
-function finishScreenEvent(record, reason, hit = null) {
-  if (!record) return;
-  record.reason = reason;
-  if (Number.isInteger(hit)) record.panelHit = hit;
-  showScreenReport();
-}
+function finishScreenEvent(record, reason, hit = null) { inputCapture.finish(record, reason, hit); }
 function releasePointer(id) {
   const p = pointers.get(id);
   if (!p) return;
@@ -571,7 +596,13 @@ function releaseKeyboard(code) {
   if (held.pad >= 0) unpressPad(held.pad);
   else unpress(held.id);
 }
+function flushPendingNoteReleases() {
+  // The worker preserves still-held owners. Once this page has sent a marked
+  // tap, lifecycle cleanup must be able to force any deferred note-up.
+  if (hasGuardedNoteInput) send({ type: "flush-key-releases" });
+}
 function releaseInputs(includeMidi = false) {
+  inputCapture?.stop("input-interrupted");
   safariPair?.end("Input interrupted. Re-arm to recalibrate.");
   clearEstimatedNotes();
   if (estimatesEnabled) {
@@ -588,6 +619,7 @@ function releaseInputs(includeMidi = false) {
     for (let i = 0; i < 16; i++) setAnalog(i, 0);
     setAnalog(20, PITCH_REST);
   }
+  flushPendingNoteReleases();
 }
 canvas.addEventListener("pointerdown", (e) => {
   const report = recordScreenEvent(e);
@@ -614,6 +646,7 @@ canvas.addEventListener("pointerdown", (e) => {
   if (!shared && [...pointers.values()].some(p => p.grab === grab)) { finishScreenEvent(report, "control-owned", grab); return; }
   const keys = board === 1 ? [0, NKEY] : [14, 41];
   const p = { grab, lastY: y, acc: 0, held: -1, buttonMask: secondary ? 2 : 1,
+    minHoldMs: screenCompatEnabled && e.pointerType === "mouse" && pianoGrab(grab) ? 20 : 0,
     keyDrag: grab >= 100 + keys[0] && grab < 100 + keys[1] };
   pointers.set(e.pointerId, p);
   // A pointer can cease being active before capture is established. Window-level
@@ -622,7 +655,7 @@ canvas.addEventListener("pointerdown", (e) => {
   if (p.grab >= 100 && p.grab < 200) {
     p.held = p.grab - 100;
     if (board === 1 && p.held < NKEY) setVelocity(ui.panel_hit_y());
-    press(p.held);
+    press(p.held, p.minHoldMs);
   } else if (board === 1 && p.grab >= 200) slide(p, y);
   finishScreenEvent(report, secondary ? "secondary-note-accepted" : "normal-pointer-accepted", grab);
 }, { passive: false });
@@ -647,7 +680,7 @@ function movePointer(e) {
       p.held = held;
       if (held >= 0) {
         if (board === 1) setVelocity(ui.panel_hit_y());
-        press(held);
+        press(held, p.minHoldMs);
       }
     }
   } else if (board === 1 && p.grab >= 300) {
@@ -661,18 +694,21 @@ function movePointer(e) {
   }
   p.lastY = y;
 }
-canvas.addEventListener("pointermove", movePointer);
+canvas.addEventListener("pointermove", e => { recordScreenEvent(e); movePointer(e); });
 addEventListener("pointermove", e => { if (e.target !== canvas) movePointer(e); });
 const release = e => {
   const owned = pointers.has(e.pointerId);
   const report = e.target === canvas || owned ? recordScreenEvent(e) : null;
   releasePointer(e.pointerId);
+  if (owned && e.type !== "pointerup") flushPendingNoteReleases();
   finishScreenEvent(report, owned ? "pointer-released" : "no-pointer-owner");
 };
 for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) canvas.addEventListener(type, release);
 for (const type of ["pointerup", "pointercancel"]) addEventListener(type, release);
-canvas.addEventListener("contextmenu", e => e.preventDefault());
-addEventListener("blur", () => releaseInputs());
+canvas.addEventListener("contextmenu", e => { const report = recordScreenEvent(e); e.preventDefault(); finishScreenEvent(report, "context-menu-prevented"); });
+for (const type of ["pointerrawupdate", "mousedown", "mouseup", "mousemove", "click", "auxclick", "touchstart", "touchend", "touchcancel"])
+  canvas.addEventListener(type, recordScreenEvent, { passive: true });
+addEventListener("blur", () => { inputCapture.stop("window-blur"); releaseInputs(); });
 // Normalize browser wheel units and keep each encoder's remainder independent.
 wheelControls = createWheelControlNormalizer({ pagePixels: () => canvas.getBoundingClientRect().height });
 canvas.addEventListener("wheel", (e) => {
@@ -764,6 +800,7 @@ function rearmEstimates() {
   if (!supportsSafariEstimate || !estimatesEnabled) return;
   safariPair.end("Trial reset."); clearEstimatedNotes();
   for (const id of [...pointers.keys()]) releasePointer(id);
+  flushPendingNoteReleases();
   wheelControls.reset();
   estimateClaimsPointers = false; waitingForAnchor = true; estimateMapping = null;
   setEstimateStatus("Ready: hold one screen finger still on a key, add the second, then move gently.");
@@ -778,6 +815,7 @@ estimateToggle?.addEventListener("change", () => {
     return;
   }
   const requested = estimateToggle.checked;
+  if (requested !== estimatesEnabled) inputCapture.stop("input-mode-changed");
   if (requested && screenCompatEnabled) setScreenCompatibility(false);
   estimatesEnabled = requested;
   estimateToggle.checked = requested;
@@ -793,8 +831,10 @@ estimateToggle?.addEventListener("change", () => {
 estimateRearm?.addEventListener("click", rearmEstimates);
 document.getElementById("touch-release")?.addEventListener("click", () => releaseInputs());
 function setScreenCompatibility(enabled) {
+  inputCapture.stop("input-mode-changed");
   safariPair?.end("Input mode changed."); clearEstimatedNotes();
   for (const id of [...pointers.keys()]) releasePointer(id);
+  flushPendingNoteReleases();
   wheelControls?.reset();
   estimatesEnabled = false; waitingForAnchor = false; estimateClaimsPointers = false; estimateMapping = null;
   if (estimateToggle) estimateToggle.checked = false;
@@ -805,7 +845,6 @@ function setScreenCompatibility(enabled) {
     ? "On: secondary-button mouse input plays piano keys only. This includes real right-clicks; it is not independent touch detection."
     : "Off. Normal pointer, keyboard and MIDI controls remain active.";
   if (supportsSafariEstimate) setEstimateStatus("Off. Normal pointer, keyboard and MIDI controls are active.");
-  screenEvents = []; lastScreenEvent = null; lastScreenTime = null;
   showScreenReport();
 }
 screenCompatToggle?.addEventListener("change", () => setScreenCompatibility(screenCompatToggle.checked));
@@ -815,15 +854,35 @@ if (screenCompatEnabled) {
   if (help) help.open = true;
   setScreenCompatibility(true);
 }
+screenCaptureStart?.addEventListener("click", () => {
+  inputCapture.start();
+});
+screenCaptureStop?.addEventListener("click", () => inputCapture.stop("manual-stop"));
 document.getElementById("screen-report-copy")?.addEventListener("click", async () => {
+  const text = inputCapture.flush();
   try {
-    await navigator.clipboard.writeText(screenInputReport?.textContent || "No local input report.");
+    await navigator.clipboard.writeText(text);
     if (screenInputStatus) screenInputStatus.textContent = "Copied the local input report.";
   } catch {
     if (screenInputStatus) screenInputStatus.textContent = "Copy is unavailable. Select and copy the local report below.";
   }
 });
-function safariGesture(e) {
+document.getElementById("screen-report-save")?.addEventListener("click", () => {
+  let url = null;
+  try {
+    url = URL.createObjectURL(new Blob([inputCapture.flush()], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `fm1-input-report-${Date.now()}.json`;
+    document.body?.append(link); link.click(); link.remove();
+    if (screenInputStatus) screenInputStatus.textContent = "Saved the local input report as JSON.";
+  } catch {
+    if (screenInputStatus) screenInputStatus.textContent = "Save is unavailable. Select and copy the local report below.";
+  } finally {
+    if (url !== null) setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+});
+showScreenReport();
+function processSafariGesture(e) {
   if (!estimatesEnabled || booting || !estimateMapping) return;
   if (estimateMapping !== readEstimateMapping()) { safariPair.end("Panel moved or resized."); return; }
   const r = canvas.getBoundingClientRect();
@@ -836,6 +895,32 @@ function safariGesture(e) {
     return;
   }
   safariPair.processGesture(e);
+}
+function safariGesture(e) {
+  let record = null;
+  if (inputCapture.state === "recording") {
+    let verifiedCanvasHit = false;
+    if (e.target !== canvas) {
+      const r = canvas.getBoundingClientRect();
+      const inside = Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
+        && e.clientX >= r.left && e.clientX <= r.left + r.width
+        && e.clientY >= r.top && e.clientY <= r.top + r.height;
+      verifiedCanvasHit = inside && typeof document.elementFromPoint === "function"
+        && document.elementFromPoint(e.clientX, e.clientY) === canvas;
+    }
+    record = recordScreenEvent(e, verifiedCanvasHit);
+    if (record) record.estimatorStateBefore = safariPair.status;
+  }
+  try {
+    processSafariGesture(e);
+  } finally {
+    if (record) {
+      record.estimatorStateAfter = safariPair.status;
+      record.estimatorReason = safariPair.reason;
+      finishScreenEvent(record, !estimatesEnabled ? "safari-gesture-observed-trial-off"
+        : booting ? "booting" : "safari-gesture-observed");
+    }
+  }
 }
 for (const type of ["gesturestart", "gesturechange", "gestureend"])
   document.addEventListener(type, safariGesture, { capture: true, passive: false });
@@ -1212,6 +1297,7 @@ async function flushRunning(pause = false) {
 // Serialize machine replacement, including the snapshot of the old machine. Requests that
 // became obsolete while downloading are skipped; every actual boot receives an acknowledgement.
 function boot(options = {}) {
+  inputCapture.stop("firmware-boot");
   releaseInputs(true);
   const seq = ++bootSeq, f = fw, clock = mhz;
   const task = async () => {
@@ -1483,6 +1569,7 @@ document.getElementById("update-firmware").addEventListener("click", action(asyn
 }));
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
+    inputCapture.stop("document-hidden");
     releaseInputs();
     if (running) flushRunning().catch(saveFailure);
   }
@@ -1491,6 +1578,7 @@ document.addEventListener("visibilitychange", () => {
 // Closing a tab is best effort: the browser may terminate the worklet before its reply.
 // Frequent quiet autosaves remain the durable fallback.
 addEventListener("pagehide", () => {
+  inputCapture.stop("pagehide");
   releaseInputs();
   if (running) flushRunning().catch(saveFailure);
 });

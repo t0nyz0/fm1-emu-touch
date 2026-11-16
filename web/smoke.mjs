@@ -3,6 +3,7 @@
 // into its MIDI IN jack (channel 1) sounds.
 //   node web/smoke.mjs [web/dist] [package.fwsc]   (a local package instead, e.g. M-VAVE's)
 import { readFileSync } from "node:fs";
+import { verifyInputPulse } from "./input-pulse.wasm.mjs";
 const dir = new URL(`${process.argv[2] || "web/dist"}/`, `file://${process.cwd()}/`);
 const { fetchPackage } = await import(new URL("fwsc.js", dir));
 const cat = JSON.parse(readFileSync(new URL("firmwares.json", dir)));
@@ -43,4 +44,13 @@ console.log(`MIDI note on: level ${quiet.toFixed(4)} -> ${note.toFixed(4)}`);
 if (x.fm1_halted() || real < 2 * 44100 || lit < 1000 || !local && !(note > 10 * quiet + 0.001)) {
   console.error("smoke test FAILED");
   process.exit(1);
+}
+
+// Felucca's keyboard is used to verify the actual worker's emulated-time tap
+// gate, using the package already fetched above. Custom firmware checks keep
+// their existing contract; this assertion is specific to the known fixture.
+if (!local) {
+  const pulse = await verifyInputPulse({ wasm: readFileSync(new URL("fm1_web.wasm", dir)),
+    firmware: bytes, workletSource: readFileSync(new URL("worklet.js", dir), "utf8") });
+  console.log(`Compatibility note pulse: ${pulse.minHoldMs} emulated ms, rendered waveform matches held-key reference`);
 }

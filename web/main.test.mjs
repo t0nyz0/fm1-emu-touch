@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import * as persistence from './persistence.js';
 import * as tryout from './tryout.js';
 import * as gestureInput from './gesture-input.js';
+import * as captureInput from './input-capture.js';
 const settle = () => new Promise(resolve => setImmediate(resolve));
 class Element {
   constructor(text = '', value = '') {
@@ -99,7 +100,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
     matchMedia: () => ({ matches: false }), confirm: () => true,
     fetchPackage: async f => ({ bytes: new Uint8Array(960).fill(f.id === 'a' ? 1 : 2), url: f.package }),
     hubNewcomers: async () => [], hubCardUrl: id => `https://thefirmwarehub.com/#fw-${id}`,
-    GestureEvent: class {}, ...persistence, ...tryout, ...gestureInput, SaveStore: class { constructor() { return disk; } }, ...extra };
+    GestureEvent: class {}, ...persistence, ...tryout, ...gestureInput, ...captureInput, SaveStore: class { constructor() { return disk; } }, ...extra };
   const source = readFileSync(new URL('./main.js', import.meta.url), 'utf8').replace(/^import .*;$/gm, '');
   const run = new Function(...Object.keys(environment), `return (async () => { ${source}\nreturn {
     startAudio, boot, flushRunning, setLatency, get running() { return running; },
@@ -756,30 +757,219 @@ test('screen=1 explicitly enables compatibility and opens its help; primary cont
   assert.deepEqual(p.keys(), [[21, true], [21, false], [22, true], [22, false]]);
 });
 
-test('local compatibility report is bounded, coordinate-free and records rejected input before filtering', async () => {
+test('explicit capture preserves discrete input and records rejected input before filtering', async () => {
   const p = await inputPage(); screenMode(p);
+  p.elements.get('screen-capture-start').dispatch('click');
   for (let i = 0; i < 10; i++) { secondary(p, 'pointerdown'); secondary(p, 'pointerup'); }
   secondary(p, 'pointerdown', 0, 10, 20);
   p.panel.dispatch('wheel', { clientX: 10, clientY: 20, deltaY: 10, deltaMode: 0, ctrlKey: true });
+  p.elements.get('screen-capture-stop').dispatch('click');
   const report = JSON.parse(p.elements.get('screen-input-report').textContent);
-  assert.equal(report.events.length, 12);
-  assert.equal(report.events.at(-2).reason, 'secondary-note-only');
-  assert.equal(report.events.at(-1).type, 'wheel');
-  assert.equal(report.events.at(-1).reason, 'wheel-rejected');
-  assert.ok(report.events.every(e => Number.isFinite(e.timeMs) && (e.dtMs === null || e.dtMs >= 0)));
-  assert.ok(report.events.every(e => !('clientX' in e) && !('clientY' in e) && !('pointerId' in e) && !('key' in e)));
-  assert.equal(report.events.at(-2).button, 2);
-  assert.equal(report.events.at(-2).buttons, 2);
+  assert.equal(report.firstDiscrete.length, 16);
+  assert.equal(report.lastDiscrete.length, 16);
+  assert.equal(report.lastDiscrete.at(-1).reason, 'secondary-note-only');
+  assert.equal(report.wheel.last.type, 'wheel');
+  assert.equal(report.wheel.last.reason, 'wheel-rejected');
+  assert.ok(report.firstDiscrete.every(e => Number.isFinite(e.timeMs) && (e.dtMs === null || e.dtMs >= 0)));
+  assert.ok(report.firstDiscrete.every(e => !('pointerId' in e) && !('key' in e)));
+  assert.equal(report.lastDiscrete.at(-1).button, 2);
+  assert.equal(report.lastDiscrete.at(-1).buttons, 2);
+  assert.equal(report.keyOutput.down, 10);
+  assert.equal(report.keyOutput.up, 10);
 });
 
 test('report copying requires the explicit button and degrades to selectable local text', async () => {
   let copied = null;
   const p = await inputPage(0, { navigator: { clipboard: { writeText: async text => { copied = text; } } } });
-  screenMode(p); secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  screenMode(p); p.elements.get('screen-capture-start').dispatch('click');
+  secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  p.elements.get('screen-capture-stop').dispatch('click');
   assert.equal(copied, null);
   await p.elements.get('screen-report-copy').listeners.click();
   assert.match(copied, /secondary-note-accepted/);
   const q = await inputPage(); screenMode(q);
   await q.elements.get('screen-report-copy').listeners.click();
   assert.match(q.elements.get('screen-input-status').textContent, /Select and copy/);
+});
+
+
+test('capture is explicit and passive, preserves the first press through wheel floods and freezes after Stop', async () => {
+  const p = await inputPage(); screenMode(p);
+  secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  assert.equal(JSON.parse(p.elements.get('screen-input-report').textContent).state, 'idle');
+  p.elements.get('screen-capture-start').dispatch('click');
+  const press = p.pointer('pointerdown', 0, 10, 60, { pointerType: 'mouse', button: 2, buttons: 2, timeStamp: 12 });
+  p.pointer('pointerup', 0, 10, 60, { pointerType: 'mouse', button: 2, buttons: 0, timeStamp: 42 });
+  for (let i = 0; i < 150; i++) p.panel.dispatch('wheel', { clientX: 90, clientY: 95, deltaX: 0, deltaY: i / 10, deltaMode: 0, ctrlKey: false, timeStamp: 50 + i });
+  const click = p.panel.dispatch('click', { clientX: 10, clientY: 60, button: 0, buttons: 0 });
+  assert.notEqual(click.defaultPrevented, true, 'new observation listeners never prevent input');
+  p.elements.get('screen-capture-stop').dispatch('click');
+  const frozen = p.elements.get('screen-input-report').textContent;
+  const report = JSON.parse(frozen);
+  assert.equal(report.counts.wheel, 150);
+  assert.equal(report.firstDiscrete[0].type, 'pointerdown');
+  assert.equal(report.firstDiscrete[1].type, 'pointerup');
+  assert.equal(report.firstDiscrete[1].eventTimeStamp - report.firstDiscrete[0].eventTimeStamp, 30);
+  assert.equal(report.wheel.last.panelHit, -1);
+  assert.equal(report.wheel.last.canvasX, 90);
+  assert.equal(report.wheel.last.canvasY, 95);
+  assert.equal(report.initialMapping.panelWidth, 100);
+  assert.equal(report.stopMapping.panelHeight, 100);
+  assert.equal(report.stopContext.audioState, 'running');
+  assert.equal(report.stopReason, 'manual-stop');
+  p.panel.dispatch('wheel', { clientX: 10, clientY: 20, deltaY: 4 });
+  p.panel.dispatch('mousemove', { clientX: 20, clientY: 50 });
+  await settle();
+  assert.equal(p.elements.get('screen-input-report').textContent, frozen, 'queued rendering and later input cannot alter a stopped report');
+});
+
+test('capture only observes canvas targets and stops on mode/lifecycle changes without changing note ownership', async () => {
+  for (const reason of ['blur', 'visibilitychange', 'pagehide', 'boot', 'mode']) {
+    const p = await inputPage(); screenMode(p); p.elements.get('screen-capture-start').dispatch('click');
+    p.panel.dispatch('mousedown', { target: new Element(), button: 0, buttons: 1, clientX: 10, clientY: 60 });
+    p.panel.dispatch('pointerrawupdate', { pointerType: 'mouse', clientX: 11, clientY: 61, buttons: 2 });
+    if (reason === 'mode') screenMode(p, false);
+    else if (reason === 'boot') await p.api.boot();
+    else if (reason === 'visibilitychange') { p.document.visibilityState = 'hidden'; p.fireDocument(reason); }
+    else p.fireWindow(reason);
+    const frozen = p.elements.get('screen-input-report').textContent;
+    const report = JSON.parse(frozen);
+    assert.equal(report.state, 'stopped', reason);
+    assert.equal(report.counts.mousedown, undefined);
+    assert.equal(report.counts.pointerrawupdate, 1);
+    assert.deepEqual(p.keys(), [], 'diagnostic motion never acquires notes');
+    p.panel.dispatch('mousemove', { clientX: 1, clientY: 1 }); await settle();
+    assert.equal(p.elements.get('screen-input-report').textContent, frozen);
+  }
+});
+
+test('explicit Save downloads the current local JSON without resetting capture', async () => {
+  let blob = null, clicked = 0, filename = null, revoked = [];
+  const p = await inputPage(0, { URL: class extends URL {
+    static createObjectURL(value) { blob = value; return 'blob:local-test'; }
+    static revokeObjectURL(url) { revoked.push(url); }
+  } });
+  const originalCreate = p.document.createElement;
+  p.document.createElement = name => {
+    const e = originalCreate(name);
+    if (name === 'a') e.click = () => { clicked++; filename = e.download; };
+    return e;
+  };
+  screenMode(p); p.elements.get('screen-capture-start').dispatch('click');
+  secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  p.elements.get('screen-capture-stop').dispatch('click');
+  const frozen = p.elements.get('screen-input-report').textContent;
+  assert.equal(clicked, 0);
+  p.elements.get('screen-report-save').dispatch('click');
+  assert.equal(clicked, 1);
+  assert.match(filename, /^fm1-input-report-\d+\.json$/);
+  assert.equal(await blob.text(), frozen);
+  assert.equal(p.elements.get('screen-input-report').textContent, frozen);
+});
+
+test('capture is available in normal mode without enabling secondary-button compatibility', async () => {
+  const p=await inputPage();
+  assert.equal(p.elements.get('screen-capture-start').disabled,false);
+  assert.notEqual(p.elements.get('screen-compat').checked,true);
+  p.elements.get('screen-capture-start').dispatch('click');
+  p.pointer('pointerdown',1,10,60,{pointerType:'mouse',button:0,buttons:1,timeStamp:10});
+  p.pointer('pointerup',1,10,60,{pointerType:'mouse',button:0,buttons:0,timeStamp:60});
+  p.elements.get('screen-capture-stop').dispatch('click');
+  const report=JSON.parse(p.elements.get('screen-input-report').textContent);
+  assert.equal(report.initialContext.inputMode,'normal');assert.equal(report.initialContext.compatibility,false);
+  assert.equal(report.stopContext.safariEstimateEnabled,false);assert.equal(report.counts.pointerdown,1);
+  assert.deepEqual(report.keyOutput,{down:1,up:1});assert.deepEqual(p.keys(),[[21,true],[21,false]]);
+});
+
+test('inactive Safari gestures are observable without enabling estimates or adding default prevention', async () => {
+  const p=await inputPage();p.elements.get('screen-capture-start').dispatch('click');
+  const start=gesture(p,'gesturestart',{timeStamp:100,scale:1.2,rotation:15});
+  const change=gesture(p,'gesturechange',{timeStamp:140,clientX:25,scale:1.3,rotation:20});
+  const end=gesture(p,'gestureend',{timeStamp:170,scale:1.3,rotation:20});
+  for(const event of [start,change,end])assert.notEqual(event.defaultPrevented,true);
+  p.elements.get('screen-capture-stop').dispatch('click');
+  const report=JSON.parse(p.elements.get('screen-input-report').textContent);
+  assert.equal(report.initialContext.inputMode,'normal');assert.equal(report.counts.gesturechange,1);
+  const first=report.gestures.gesturestart.first,last=report.gestures.gestureend.last;
+  assert.equal(first.scale,1.2);assert.equal(first.rotationDeg,15);
+  assert.equal(first.reason,'safari-gesture-observed-trial-off');assert.equal(first.defaultPrevented,false);
+  assert.equal(last.eventTimeStamp-first.eventTimeStamp,70);assert.equal(last.estimatorStateAfter,'disarmed');
+  assert.deepEqual(p.audio.messages,[],'observation cannot acquire notes');
+});
+
+test('active Safari capture records handled geometry after existing note processing and prevention', async () => {
+  const p=await estimatedPage();p.elements.get('screen-capture-start').dispatch('click');
+  p.pointer('pointerdown',1,10,60,{isTrusted:true,pointerType:'mouse',timeStamp:100});
+  gesture(p,'gesturestart',{timeStamp:120});gesture(p,'gesturechange',{timeStamp:160,rotation:2});
+  gesture(p,'gestureend',{timeStamp:200});p.elements.get('screen-capture-stop').dispatch('click');
+  const report=JSON.parse(p.elements.get('screen-input-report').textContent);
+  assert.equal(report.initialContext.inputMode,'safari-estimate');assert.equal(report.initialContext.compatibility,false);
+  const first=report.gestures.gesturestart.first,last=report.gestures.gestureend.last;
+  assert.equal(first.estimatorStateBefore,'armed');assert.equal(first.estimatorStateAfter,'tracking');
+  assert.equal(first.defaultPrevented,true);assert.equal(last.defaultPrevented,true);
+  assert.equal(last.estimatorStateAfter,'ended');assert.equal(last.estimatorReason,'gestureend');
+  assert.equal(report.keyOutput.down,2);assert.equal(report.keyOutput.up,2);
+  assert.deepEqual(p.keys(),[[21,true],[22,true],[21,false],[22,false]]);
+});
+
+test('Safari diagnostic scoping requires a canvas target or an inside position verified by hit testing', async () => {
+  const p=await inputPage();p.elements.get('screen-capture-start').dispatch('click');
+  const elsewhere=new Element();
+  gesture(p,'gesturechange',{target:elsewhere}); // no elementFromPoint: cannot verify fallback
+  p.document.elementFromPoint=()=>elsewhere;gesture(p,'gesturechange',{target:elsewhere});
+  p.document.elementFromPoint=()=>p.panel;gesture(p,'gesturechange',{target:elsewhere,clientX:120});
+  gesture(p,'gesturechange',{target:elsewhere,clientX:20,clientY:60,timeStamp:40});
+  gesture(p,'gesturechange',{target:p.panel,clientX:120,timeStamp:50}); // capture the owned target even when estimator would reject its position
+  p.elements.get('screen-capture-stop').dispatch('click');
+  const report=JSON.parse(p.elements.get('screen-input-report').textContent),entry=report.gestures.gesturechange;
+  assert.equal(report.counts.gesturechange,2);assert.equal(entry.first.scopeBasis,'verified-canvas-hit');
+  assert.equal(entry.last.scopeBasis,'canvas-target');assert.deepEqual(p.keys(),[]);
+});
+
+test('effective Safari mode changes freeze captures while diagnostic starts remain available in each mode', async () => {
+  const p=await inputPage();p.elements.get('screen-capture-start').dispatch('click');enableEstimates(p);
+  const frozen=p.elements.get('screen-input-report').textContent;
+  assert.equal(JSON.parse(frozen).state,'stopped');assert.equal(JSON.parse(frozen).stopReason,'input-mode-changed');
+  gesture(p,'gesturechange');await settle();assert.equal(p.elements.get('screen-input-report').textContent,frozen);
+  p.elements.get('screen-capture-start').dispatch('click');screenMode(p,true);
+  const next=JSON.parse(p.elements.get('screen-input-report').textContent);
+  assert.equal(next.initialContext.inputMode,'safari-estimate');assert.equal(next.state,'stopped');
+  p.elements.get('screen-capture-start').dispatch('click');p.elements.get('screen-capture-stop').dispatch('click');
+  assert.equal(JSON.parse(p.elements.get('screen-input-report').textContent).initialContext.inputMode,'secondary-compatibility');
+});
+
+
+test('only explicit compatibility mouse piano presses request an emulated minimum pulse', async () => {
+  const p=await inputPage();
+  p.pointer('pointerdown',1,10,60,{pointerType:'mouse'});p.pointer('pointerup',1);
+  assert.equal(p.audio.messages.find(m=>m.type==='key'&&m.down).minHoldMs,undefined);
+  screenMode(p);p.audio.messages.length=0;
+  p.pointer('pointerdown',2,10,60,{pointerType:'mouse'});p.pointer('pointerup',2);
+  assert.equal(p.audio.messages.find(m=>m.type==='key'&&m.down).minHoldMs,20);
+  assert.equal(p.audio.messages.filter(m=>m.type==='flush-key-releases').length,0,'normal up and its capture-loss notification retain the short-tap guard');
+  p.audio.messages.length=0;p.key('keydown');p.key('keyup');
+  assert.equal(p.audio.messages.find(m=>m.type==='key'&&m.down).minHoldMs,undefined,'keyboard remains immediate');
+  p.audio.messages.length=0;
+  p.pointer('pointerdown',3,10,60,{pointerType:'touch'});p.pointer('pointerup',3);
+  assert.equal(p.audio.messages.find(m=>m.type==='key'&&m.down).minHoldMs,undefined,'actual independent contacts remain immediate');
+  p.audio.messages.length=0;
+  p.pointer('pointerdown',4,10,40,{pointerType:'mouse'});p.pointer('pointerup',4);
+  assert.equal(p.audio.messages.find(m=>m.type==='key'&&m.down).minHoldMs,undefined,'transport is not pulse-stretched');
+});
+test('compatibility glissando marks each musical note and cancellation forces pending release', async () => {
+  const p=await inputPage();screenMode(p);
+  secondary(p,'pointerdown');secondary(p,'pointermove',0,30);
+  assert.deepEqual(p.audio.messages.filter(m=>m.type==='key'&&m.down).map(m=>m.minHoldMs),[20,20]);
+  secondary(p,'pointercancel',0,30);
+  assert.ok(p.audio.messages.some(m=>m.type==='flush-key-releases'));
+});
+test('lifecycle and input-mode cleanup flush deferred compatibility note releases', async () => {
+  for(const reason of ['blur','pagehide','boot','mode']){
+    const p=await inputPage();screenMode(p);
+    secondary(p,'pointerdown');secondary(p,'pointerup');p.audio.messages.length=0;
+    if(reason==='mode')screenMode(p,false);
+    else if(reason==='boot')await p.api.boot();
+    else p.fireWindow(reason);
+    assert.ok(p.audio.messages.some(m=>m.type==='flush-key-releases'),reason);
+  }
 });

@@ -67,20 +67,25 @@ class Fm1 extends AudioWorkletProcessor {
     this.calls = 0;
     this.bootToken = 0;
     this.snapshots = [];
+    this.keyPulseEpoch = 0;
+    this.keyPulses = new Map();
     this.port.onmessageerror = () => this.port.postMessage({ type: "error", message: "a message could not be read" });
     this.port.onmessage = async (e) => {
       const m = e.data;
       if (m.type === "boot") {
+        this.resetKeyPulses();
         const token = ++this.bootToken;
         // Keep the previous (paused) instance until the replacement boots successfully.
         try {
           await this.boot(m, token);
         } catch (err) {
           if (token !== this.bootToken) return;
+          this.resetKeyPulses();
           this.paused = false;
           this.port.postMessage({ type: "error", seq: m.seq, message: `boot: ${err}` });
         }
       } else if (m.type === "cancel-boot") {
+        this.resetKeyPulses();
         ++this.bootToken;
         this.x = null;
         this.snapshots = [];
@@ -93,7 +98,8 @@ class Fm1 extends AudioWorkletProcessor {
           this.flushSnapshots();
         } else if (m.type === "cancel-snapshot") this.snapshots = this.snapshots.filter(r => r.request !== m.request);
         else if (m.type === "resume") this.paused = false;
-        else if (m.type === "key") this.x.fm1_key(m.id, m.down ? 1 : 0);
+        else if (m.type === "key") this.applyKey(m);
+        else if (m.type === "flush-key-releases") this.flushKeyReleases();
         else if (m.type === "enc") this.x.fm1_enc(m.enc, m.clicks);
         else if (m.type === "pot") this.x.fm1_pot(m.value);
         else if (m.type === "midi") for (const b of m.bytes) this.x.fm1_midi(b);
@@ -101,6 +107,69 @@ class Fm1 extends AudioWorkletProcessor {
         else if (m.type === "vel") this.x.fm1_velocity(m.us);             // SMK-37: the next keys' velocity
       }
     };
+  }
+
+  // Only explicitly marked musical notes receive a minimum simulated hold.
+  // The ordinary input path stays immediate; no wall-clock timers are used.
+  applyKey(message) {
+    const x = this.x, id = message.id;
+    const max = this.board === 1 ? 54 : 40;
+    if (!x || !Number.isSafeInteger(id) || id < 0 || id > max) return;
+    const musical = this.board === 1 ? id < 37 : id >= 14;
+    const validMinimum = musical && typeof message.minHoldMs === "number"
+      && Number.isFinite(message.minHoldMs) && message.minHoldMs > 0 && message.minHoldMs <= 100;
+    let pulse = this.keyPulses.get(id);
+    if (pulse && (pulse.epoch !== this.keyPulseEpoch || pulse.machine !== x)) {
+      this.keyPulses.delete(id); pulse = null;
+    }
+    if (message.down && !validMinimum) {
+      this.keyPulses.delete(id); x.fm1_key(id, 1); return;
+    }
+    if (!message.down && !pulse) { x.fm1_key(id, 0); return; }
+    const clock = x.fm1_ms();
+    const clockValid = Number.isFinite(clock) && clock >= 0 && clock <= Number.MAX_SAFE_INTEGER;
+    if (message.down) {
+      // A new owner cancels any deferred up. An unmarked owner restores the
+      // existing immediate release semantics for keyboard/default input.
+      this.keyPulses.delete(id);
+      if (validMinimum && clockValid && Number.isSafeInteger(Math.ceil(clock + message.minHoldMs))) {
+        this.keyPulses.set(id, { desired: true, start: clock, minimumAt: clock + message.minHoldMs,
+          epoch: this.keyPulseEpoch, machine: x });
+      }
+      x.fm1_key(id, 1);
+      return;
+    }
+    if (pulse && clockValid && clock >= pulse.start && clock < pulse.minimumAt) {
+      pulse.desired = false;
+      return;
+    }
+    this.keyPulses.delete(id);
+    x.fm1_key(id, 0);
+  }
+
+  drainKeyReleases(force = false) {
+    const x = this.x;
+    if (!x || !this.keyPulses.size) return;
+    const clock = force ? 0 : x.fm1_ms();
+    const clockValid = Number.isFinite(clock) && clock >= 0 && clock <= Number.MAX_SAFE_INTEGER;
+    for (const [id, pulse] of this.keyPulses) {
+      if (pulse.epoch !== this.keyPulseEpoch || pulse.machine !== x) { this.keyPulses.delete(id); continue; }
+      const invalidClock = !force && (!clockValid || clock < pulse.start);
+      if (!pulse.desired && (force || invalidClock || clock >= pulse.minimumAt)) {
+        this.keyPulses.delete(id);
+        x.fm1_key(id, 0);
+      } else if (invalidClock) this.keyPulses.delete(id); // Retain a real held-down key; its next up is immediate.
+    }
+  }
+
+  flushKeyReleases() { this.drainKeyReleases(true); }
+
+  resetKeyPulses() {
+    // Failed replacement boots retain the old machine. Finish its already
+    // released notes before retiring their bookkeeping, or they could stick.
+    try { this.flushKeyReleases(); } catch { /* A retiring/faulted instance must not block cleanup. */ }
+    this.keyPulses.clear();
+    this.keyPulseEpoch++;
   }
 
   async boot(m, token) {
@@ -138,6 +207,7 @@ class Fm1 extends AudioWorkletProcessor {
     if (m.script?.byteLength && (!x.fm1_bench_script || x.fm1_bench_script(copy(m.script), m.script.byteLength) !== 0)) {
       throw new Error("the input script did not load");
     }
+    this.resetKeyPulses();
     this.x = x;                         // (a reboot replaces the whole instance)
     this.mhz = m.mhz;
     this.ahead = ahead;
@@ -187,7 +257,7 @@ class Fm1 extends AudioWorkletProcessor {
         if (request.request !== undefined && now() - request.started >= 1500) {
           // A constantly writing firmware must not prevent switching away. Keep its
           // last stable save instead of persisting a possibly half-written sector.
-          if (request.pause) this.paused = true;
+          if (request.pause) { this.flushKeyReleases(); this.paused = true; }
           this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request,
             unavailable: true, error: request.pause ? null : "flash did not become quiet; try saving again" });
         } else this.snapshots.push(request);
@@ -197,7 +267,7 @@ class Fm1 extends AudioWorkletProcessor {
       this.flashRevision = x.fm1_flash_revision();
       this.observedRevision = this.flashRevision;
       this.lastSnapshot = now();
-      if (request.pause) this.paused = true;
+      if (request.pause) { this.flushKeyReleases(); this.paused = true; }
       this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request,
         revision: this.flashRevision, flash }, [flash.buffer]);
     }
@@ -212,8 +282,11 @@ class Fm1 extends AudioWorkletProcessor {
     const t0 = now();
     let have;
     try {
+      this.drainKeyReleases();
       have = x.fm1_render(n, this.budget);
+      this.drainKeyReleases();
     } catch (err) {                       // a trap in the emulator: stop and say so
+      this.resetKeyPulses();
       this.x = null;
       for (const request of this.snapshots.splice(0)) {
         this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request, unavailable: true });

@@ -222,3 +222,123 @@ test("a try-out's sectors and input script are installed before the first quantu
   await h.p.port.onmessage({ data: { type: 'boot', seq: 3, mhz: 100, package: new Uint8Array(960).buffer, script: script.buffer } });
   assert.ok(h.messages.some(m => m.type === 'error' && m.seq === 3 && /input script/.test(m.message)));
 });
+
+function pulseHarness(board = 0, step = 3) {
+  const h = harness(), keys = new Set(), calls = [], frames = [];
+  let ms = 0;
+  h.p.board = board;
+  h.p.x.fm1_ms = () => ms;
+  h.p.x.fm1_key = (id, down) => { calls.push([id, down, ms]); if (down) keys.add(id); else keys.delete(id); };
+  h.p.x.fm1_render = n => { frames.push({ at: ms, keys: [...keys] }); ms += step; return n; };
+  return { ...h, keys, calls, frames, simTime: value => { ms = value; },
+    key: (id, down, minHoldMs) => h.p.port.onmessage({ data: { type: 'key', id, down, ...(minHoldMs === undefined ? {} : { minHoldMs }) } }),
+    flush: () => h.p.port.onmessage({ data: { type: 'flush-key-releases' } }) };
+}
+
+test('explicit note pulse survives same-cycle down/up until twenty emulated milliseconds elapse', async () => {
+  const h = pulseHarness();
+  await h.key(21, true, 20); await h.key(21, false);
+  assert.deepEqual(h.calls, [[21, 1, 0]]);
+  for (let i = 0; i < 6; i++) h.render();
+  assert.deepEqual(h.calls, [[21, 1, 0]], '18 simulated milliseconds must not release early');
+  h.render();
+  assert.deepEqual(h.calls, [[21, 1, 0], [21, 0, 21]]);
+  assert.ok(h.frames.every(f => f.keys.includes(21)), 'firmware receives actual held render intervals');
+  h.render(); assert.deepEqual(h.frames.at(-1).keys, []);
+  assert.equal(h.p.keyPulses.size, 0);
+});
+
+test('unmarked/default input and non-musical buttons retain immediate behavior without reading a guard clock', async () => {
+  for (const [board, id] of [[0,21],[0,13],[1,37],[1,54]]) {
+    const h = pulseHarness(board);
+    h.p.x.fm1_ms = () => { throw new Error('ordinary input must not read pulse clock'); };
+    await h.key(id,true,id === 21 ? undefined : 20); await h.key(id,false);
+    assert.deepEqual(h.calls, [[id,1,0],[id,0,0]]);
+    assert.equal(h.p.keyPulses.size,0);
+  }
+});
+
+test('both board note ranges are eligible; malformed IDs and guard metadata cannot wrap or create indefinite pulses', async () => {
+  for (const [board,id] of [[0,14],[0,40],[1,0],[1,36]]) {
+    const h=pulseHarness(board); await h.key(id,true,20); await h.key(id,false);
+    assert.equal(h.p.keyPulses.size,1); h.simTime(20); h.render(); assert.deepEqual(h.calls.at(-1),[id,0,20]);
+  }
+  for (const min of [NaN,Infinity,-1,0,101,'20',null]) {
+    const h=pulseHarness(); await h.key(21,true,min); await h.key(21,false);
+    assert.deepEqual(h.calls,[[21,1,0],[21,0,0]],String(min)); assert.equal(h.p.keyPulses.size,0);
+  }
+  const h=pulseHarness();
+  for(const id of [-1,1.5,256,NaN,Infinity,'21',41]) { await h.key(id,true,20); await h.key(id,false); }
+  assert.deepEqual(h.calls,[]);
+});
+
+test('independent delayed releases do not end a sustained or shared-owner hold', async () => {
+  const h=pulseHarness();
+  await h.key(21,true,20); await h.key(22,true,20); await h.key(21,false);
+  h.simTime(20); h.render();
+  assert.deepEqual([...h.keys],[22]);
+  h.simTime(100); h.render(); assert.deepEqual([...h.keys],[22]);
+  await h.key(22,false); assert.deepEqual([...h.keys],[]);
+});
+
+test('marked re-down extends the new minimum; unmarked takeover cancels stale release and restores immediate semantics', async () => {
+  const h=pulseHarness();
+  await h.key(21,true,20); await h.key(21,false); h.simTime(10);
+  await h.key(21,true,20); await h.key(21,false);
+  h.simTime(20); h.render(); assert.equal(h.calls.filter(c => c[1] === 0).length,0);
+  h.simTime(30); h.render(); assert.deepEqual(h.calls.at(-1),[21,0,30]);
+  const q=pulseHarness();
+  await q.key(21,true,20); await q.key(21,false); q.simTime(10);
+  await q.key(21,true); await q.flush();
+  assert.deepEqual([...q.keys],[21], 'a still-held unmarked owner survives a force flush');
+  await q.key(21,false); assert.deepEqual(q.calls.at(-1),[21,0,10]);
+  q.simTime(100); q.render(); assert.equal(q.calls.filter(c => c[1] === 0).length,1);
+});
+
+test('pulse duration follows simulation rather than wall time and forced release works while paused', async () => {
+  const h=pulseHarness(0,0);
+  await h.key(21,true,20); await h.key(21,false); await h.key(22,true,20);
+  h.advance(100000); h.render(); assert.deepEqual([...h.keys],[21,22]);
+  h.p.paused=true;
+  h.p.x.fm1_ms=()=>{throw new Error('a forced cleanup must not need the simulation clock');};
+  await h.flush(); assert.deepEqual([...h.keys],[22]);
+  assert.equal(h.p.keyPulses.get(22).desired,true);
+});
+
+test('backward or nonfinite simulation time releases a pending up without leaving sticky bookkeeping', async () => {
+  for(const next of [-1,NaN,Infinity]) {
+    const h=pulseHarness(); h.simTime(10); await h.key(21,true,20); await h.key(21,false);
+    h.simTime(next); h.render(); assert.equal(h.keys.has(21),false,String(next)); assert.equal(h.p.keyPulses.size,0);
+  }
+});
+
+test('failed replacement boot completes pending old-machine ups before retaining the previous instance', async () => {
+  const h=pulseHarness(), previous=h.p.x;
+  await h.key(21,true,20); await h.key(21,false); await h.key(22,true,20);
+  await h.p.port.onmessage({data:{type:'boot',seq:2,wasm:new Uint8Array([0]).buffer}});
+  assert.equal(h.p.x,previous); assert.equal(h.p.keyPulses.size,0);
+  assert.deepEqual([...h.keys],[22], 'already released note is cleared; actual held note is retained');
+  await h.key(22,false); assert.deepEqual([...h.keys],[]);
+});
+
+test('cancelled boot and fatal render retire deferred state; old machine or epoch entries cannot release a replacement note', async () => {
+  for(const reason of ['cancel','fatal']) {
+    const h=pulseHarness(); await h.key(21,true,20); await h.key(21,false);
+    if(reason==='cancel') await h.p.port.onmessage({data:{type:'cancel-boot',seq:2}});
+    else { h.p.x.fm1_render=()=>{throw new Error('trap');};h.render(); }
+    assert.equal(h.p.x,null); assert.equal(h.p.keyPulses.size,0); assert.deepEqual([...h.keys],[]);
+  }
+  for(const stale of ['machine','epoch']) {
+    const h=pulseHarness(); await h.key(21,true,20); await h.key(21,false);
+    if(stale==='machine') h.p.x={...h.p.x,fm1_key:()=>{throw new Error('must not release into replacement');}};
+    else h.p.keyPulseEpoch++;
+    h.simTime(100); assert.doesNotThrow(()=>h.p.drainKeyReleases()); assert.equal(h.p.keyPulses.size,0);
+  }
+});
+
+test('pausing for a snapshot flushes pending ups while preserving notes still physically desired', async () => {
+  const h=pulseHarness(); await h.key(21,true,20); await h.key(21,false); await h.key(22,true,20);
+  h.advance(500);
+  await h.p.port.onmessage({data:{type:'snapshot',seq:1,request:50,pause:true}});
+  assert.equal(h.p.paused,true); assert.deepEqual([...h.keys],[22]);
+});

@@ -55,16 +55,25 @@
       <details class="touch-experiment" id="screen-input-help">
         <summary>Mac screen input compatibility</summary>
         <p>For screen holds reported as right-clicks. This mode also lets real right-clicks play piano
-          keys. It provides one pointer; it does not add independent fingers.</p>
+          keys. Short completed clicks get a 20 ms minimum note. It provides one pointer; it does not add independent fingers.</p>
         <div class="touch-actions">
           <label><input type="checkbox" id="screen-compat"> Enable single-pointer compatibility</label>
         </div>
         <p id="screen-input-status" role="status" aria-live="polite">Off. Normal input is active.</p>
-        <p>After Start, hold one screen finger on a piano key for a second, then lift.</p>
+        <p>Start the emulator, then start input capture. Hold one screen finger on a piano key for two seconds,
+          lift, then stop capture. The report freezes so scrolling or copying cannot replace the test.</p>
         <details>
           <summary>Input report · stays on this page</summary>
+          <div class="touch-actions">
+            <button type="button" id="screen-capture-start">Start input capture</button>
+            <button type="button" id="screen-capture-stop" disabled>Stop input capture</button>
+          </div>
+          <p id="screen-capture-status" role="status" aria-live="polite">Capture is stopped.</p>
           <pre id="screen-input-report" aria-label="Recent panel input events">No input recorded.</pre>
-          <button type="button" id="screen-report-copy">Copy input report</button>
+          <div class="touch-actions">
+            <button type="button" id="screen-report-copy">Copy input report</button>
+            <button type="button" id="screen-report-save">Save input report</button>
+          </div>
         </details>
       </details>
       <details class="touch-experiment">
@@ -84,7 +93,7 @@
         <span class="keyb"><kbd>Z</kbd> <kbd>X</kbd> octave</span>
         <span class="keyb"><kbd>Space</kbd> PLAY</span>
         <span class="keyb">drag or scroll a knob</span>
-        <span class="touch">Play chords with several fingers · drag a knob up / down</span>
+        <span class="touch">Touch support varies by browser · drag a knob up / down</span>
         <a class="more" href="#guide">How to use it ↓</a>
       </p>
     </div>
@@ -283,7 +292,7 @@ Thanks to bask209, eubide and pcace.</textarea>
         <ul>
           <li>Click a key or button, or drag across the keys for a glissando.</li>
           <li>Drag a knob up or down, or scroll over it. MASTER is the volume.</li>
-          <li>On a touch screen every finger counts: play chords, or hold a key while you turn a knob.</li>
+          <li>Browsers that report each finger independently support chords and simultaneous controls. Mac screen input is experimental; use the compatibility controls above to test it.</li>
           <li>On a phone, turn it sideways: the synth fills the screen.</li>
         </ul>
       </section>
