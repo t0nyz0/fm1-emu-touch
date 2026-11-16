@@ -22,23 +22,47 @@ before deployment. `/build.json` identifies the exact published source commit.
 The original project's releases remain linked and clearly attributed separately
 from this fork's source.
 
-Safari uses the same Pointer Events path as other browsers. Connected Safari
-27.2 exposed `PointerEvent` and `touch-action: none`, while reporting
-`maxTouchPoints: 0` and no legacy `TouchEvent`; those reports are not used to
-disable input. No PROLED-specific JavaScript API or parallel legacy touch
-handlers are required by the documented browser API.
+The default browser input uses Pointer Events and per-pointer capture. It already
+handles independent contacts where a browser actually supplies them. Safari and
+Firefox on the tested PROLED Mac exposed a mouse-compatible pointer rather than
+independent touch contacts. Synthetic multi-pointer tests validate our ownership
+logic, not physical browser delivery.
 
-Browser fixes cover shared keyboard/pointer ownership, independent contact and
-pad release, glissando outside and back into the keybed, unavailable pointer
-capture, secondary mouse buttons, and release on blur, hidden pages, page exit
-and firmware reboot. Browser tests dispatch independent contacts through the
-actual page handlers. Synthetic events validate state and DOM behavior; they do
-not establish physical finger delivery or operating-system gesture arbitration.
+The local direct-code port adds a dependency-free `web/gesture-input.js`:
 
-The initial Safari 27.2 check booted Felucca through its actual AudioWorklet and
-passed eight synthetic DOM checks against the built page, including secondary
-contacts, shared keyboard ownership, glissando, knobs, capture failure and blur
-cleanup. Physical touchscreen and trusted pointer-capture delivery remain untested.
+- Wheel input is normalized from pixels, lines or pages. Encoder remainders are
+  isolated per control and cleared on input resets. Ctrl/Command-wheel does not
+  change synth parameters; it remains available for browser zoom.
+- Both instrument pages offer an **off-by-default Safari estimated two-note
+  trial**. It reconstructs two positions from a first-point anchor plus Safari
+  gesture center, scale and rotation. It does not expose real contact identities.
+- Estimated hits are restricted to musical keys. They cannot operate recording,
+  transport buttons, pads, sliders or knobs. Firmware still determines what a
+  key press does in its current mode. The first normal pointer's
+  note is transferred without retriggering it, and keyboard/MIDI owners remain
+  independent.
+- Tracking ends on gesture end, invalid geometry, viewport changes, focus loss,
+  page hiding, firmware changes, disable or **500 ms without updates**. Both
+  model notes are released and later updates cannot revive that trial. Press
+  **Re-arm** before another trial.
+
+This experiment does **not** support dependable held chords, independent finger
+lifts or three-plus contacts. A motionless chord is deliberately cut off after
+500 ms, because silence cannot establish whether either finger is still down.
+The assumed live centroid and stationary initial anchor can also be wrong. The
+underlying estimator was visually tested in an ordinary Safari tab on this Mac;
+**the integrated FM-1 musical experiment still needs a physical test**. Firefox's
+verified aggregate zoom does not establish independently playable fingers.
+
+To try the local candidate: start the emulator, expand **Experimental Safari
+two-finger input**, enable the trial, hold one screen finger still on a key, then
+add a second and move gently. A/B outlines are explicitly estimated. Re-arm after
+each trial; disable to return to normal panel input. **Release local notes** ends
+local keyboard/pointer/model holds without stopping separately held MIDI notes.
+
+No use-gesture, React or prototype package dependency is added. No global capture,
+browser settings or system permissions are required. Existing real pointer,
+keyboard, MIDI and native AppKit input paths remain in place.
 
 ## Native panels
 

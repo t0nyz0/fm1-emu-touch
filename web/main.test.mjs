@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as persistence from './persistence.js';
 import * as tryout from './tryout.js';
+import * as gestureInput from './gesture-input.js';
 const settle = () => new Promise(resolve => setImmediate(resolve));
 class Element {
   constructor(text = '', value = '') {
@@ -23,7 +24,7 @@ class Element {
   hasPointerCapture(id) { return this.captures.has(id); }
   releasePointerCapture(id) { this.captures.delete(id); this.listeners.lostpointercapture?.({ pointerId: id }); }
   dispatch(type, fields = {}) {
-    const event = { target: this, preventDefault() { this.defaultPrevented = true; }, ...fields };
+    const event = { type, target: this, preventDefault() { this.defaultPrevented = true; }, ...fields };
     this.listeners[type]?.(event);
     return event;
   }
@@ -98,7 +99,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
     matchMedia: () => ({ matches: false }), confirm: () => true,
     fetchPackage: async f => ({ bytes: new Uint8Array(960).fill(f.id === 'a' ? 1 : 2), url: f.package }),
     hubNewcomers: async () => [], hubCardUrl: id => `https://thefirmwarehub.com/#fw-${id}`,
-    ...persistence, ...tryout, SaveStore: class { constructor() { return disk; } }, ...extra };
+    ...persistence, ...tryout, ...gestureInput, SaveStore: class { constructor() { return disk; } }, ...extra };
   const source = readFileSync(new URL('./main.js', import.meta.url), 'utf8').replace(/^import .*;$/gm, '');
   const run = new Function(...Object.keys(environment), `return (async () => { ${source}\nreturn {
     startAudio, boot, flushRunning, setLatency, get running() { return running; },
@@ -107,7 +108,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
   }; })()`);
   const api = await run(...Object.values(environment));
   const dispatch = (listeners, type, fields) => {
-    const event = { target: new Element(), preventDefault() { this.defaultPrevented = true; }, ...fields };
+    const event = { type, target: new Element(), preventDefault() { this.defaultPrevented = true; }, ...fields };
     listeners[type]?.(event); return event;
   };
   return { api, disk, elements, location, document, expireBoot: () => bootTimer(), get audio() { return audio; },
@@ -339,6 +340,7 @@ async function inputPage(board = 0, extra = {}) {
   const p = await page(storage(), '', '', false, { ...extra, board, panelExports: {
     panel_hit: (x, y) => {
       if (y >= 50 && y < 90 && x >= 0 && x < 40) return (board ? 112 : 121) + Math.floor(x / 20);
+      if (y >= 30 && y < 50) return 112; // transport/control button, never an estimated note
       if (y >= 10 && y < 30) {
         if (x < 20) return board ? 200 : 0;
         if (x < 40) return board ? 400 : 1;
@@ -489,4 +491,160 @@ test('input during a pending firmware boot cannot leave invisible held controls'
   p.audio.messages.length = 0;
   p.pointer('pointerup', 1); p.key('keyup');
   assert.deepEqual(p.audio.messages, []);
+});
+
+
+// Direct-port integration tests: these events are synthetic and prove ownership,
+// not that any particular browser supplies independent physical screen contacts.
+const wheel = (p, x, dy, fields = {}) => p.panel.dispatch('wheel', {
+  clientX: x, clientY: 20, deltaX: 0, deltaY: dy, deltaMode: 0, ...fields,
+});
+function enableEstimates(p) {
+  const toggle = p.elements.get('touch-estimates');
+  toggle.checked = true; toggle.dispatch('change');
+}
+function gesture(p, type, fields = {}) {
+  return p.fireDocument(type, { target: p.panel, isTrusted: true, cancelable: true,
+    clientX: 20, clientY: 60, scale: 1, rotation: 0, ...fields });
+}
+function estimateClock() {
+  let time = 0, serial = 0;
+  const timers = new Map();
+  return {
+    factory: options => gestureInput.createSafariPairEstimator({ ...options,
+      now: () => time, setTimer: (fn, ms) => { const id = ++serial; timers.set(id, { fn, at: time + ms }); return id; },
+      clearTimer: id => timers.delete(id),
+    }),
+    advance(ms) { time += ms; for (const [id, t] of [...timers]) if (t.at <= time) { timers.delete(id); t.fn(); } },
+  };
+}
+async function estimatedPage() {
+  const clock = estimateClock();
+  const p = await inputPage(0, { createSafariPairEstimator: clock.factory });
+  enableEstimates(p);
+  return { ...p, clock };
+}
+function beginPair(p) {
+  p.pointer('pointerdown', 1, 10, 60, { isTrusted: true, pointerType: 'mouse' });
+  return gesture(p, 'gesturestart');
+}
+test('wheel uses normalized units and encoder residuals stay with their own knobs', async () => {
+  const p = await inputPage();
+  wheel(p, 10, -24); wheel(p, 30, -24);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'enc'), []);
+  wheel(p, 10, -16);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'enc').map(m => [m.enc, m.clicks]), [[0, 1]]);
+  wheel(p, 30, -1, { deltaMode: 1 });
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'enc').map(m => [m.enc, m.clicks]), [[0, 1], [1, 1]]);
+  wheel(p, 10, -1, { deltaMode: 2 });
+  assert.equal(p.audio.messages.filter(m => m.type === 'enc').at(-1).clicks, 2);
+});
+test('browser zoom and malformed wheel input cannot alter synth parameters', async () => {
+  const p = await inputPage();
+  for (const fields of [{ ctrlKey: true }, { metaKey: true }, { deltaY: NaN }, { deltaMode: 8 }]) {
+    assert.notEqual(wheel(p, 10, -100, fields).defaultPrevented, true);
+  }
+  assert.deepEqual(p.audio.messages, []);
+});
+test('wheel residual is cleared by firmware reset', async () => {
+  const p = await inputPage(); wheel(p, 10, -24);
+  await p.api.boot(); p.audio.messages.length = 0;
+  wheel(p, 10, -24);
+  assert.deepEqual(p.audio.messages.filter(m => m.type === 'enc'), []);
+});
+test('experimental Safari pair transfers first note and preserves independent keyboard ownership', async () => {
+  const p = await estimatedPage();
+  assert.equal(beginPair(p).defaultPrevented, true);
+  assert.deepEqual(p.keys(), [[21, true], [22, true]], 'first note is transferred without a retrigger');
+  p.key('keydown');
+  gesture(p, 'gestureend');
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [22, false]]);
+  p.key('keyup'); assert.deepEqual(p.keys().at(-1), [21, false]);
+  p.audio.messages.length = 0;
+  gesture(p, 'gesturechange', { scale: 2 });
+  p.pointer('pointerdown', 8, 10, 60, { isTrusted: true, pointerType: 'mouse' });
+  assert.deepEqual(p.audio.messages, [], 'late gesture and compatibility pointers stay locked out until re-arm');
+});
+test('stationary estimated chord ends after silence and cannot revive without re-arm', async () => {
+  const p = await estimatedPage(); beginPair(p);
+  p.clock.advance(501);
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false], [22, false]]);
+  p.audio.messages.length = 0;
+  gesture(p, 'gesturechange'); assert.deepEqual(p.audio.messages, []);
+  p.elements.get('touch-rearm').dispatch('click');
+  beginPair(p); assert.deepEqual(p.keys(), [[21, true], [22, true]]);
+  p.clock.advance(501);
+});
+test('estimates cannot operate transport, knobs, pads or out-of-panel keys', async () => {
+  const p = await estimatedPage();
+  beginPair(p);
+  gesture(p, 'gesturechange', { clientY: 20 }); // both estimates over knobs
+  gesture(p, 'gesturechange', { clientY: 40 }); // both estimates over transport controls
+  gesture(p, 'gesturechange', { clientX: 90 }); // one beyond the panel, one beyond its keys
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false], [22, false]]);
+  assert.deepEqual(p.audio.messages.filter(m => ['enc', 'pot', 'analog'].includes(m.type)), []);
+  gesture(p, 'gestureend');
+});
+test('model owners reconcile without retriggering when estimated endpoints swap keys', async () => {
+  const p = await estimatedPage(); beginPair(p);
+  gesture(p, 'gesturechange', { rotation: 180 });
+  assert.deepEqual(p.keys(), [[21, true], [22, true]]);
+  gesture(p, 'gestureend');
+});
+test('experimental trials end on lifecycle changes and preserve off-by-default controls', async () => {
+  for (const why of ['blur', 'resize', 'scroll', 'visibilitychange', 'pagehide', 'boot', 'disabled']) {
+    const p = await estimatedPage(); beginPair(p);
+    if (why === 'boot') await p.api.boot();
+    else if (why === 'disabled') { const t = p.elements.get('touch-estimates'); t.checked = false; t.dispatch('change'); }
+    else if (why === 'visibilitychange') { p.document.visibilityState = 'hidden'; p.fireDocument(why); }
+    else p.fireWindow(why);
+    assert.equal(p.keys().filter(([, on]) => on).length, 2, why);
+    assert.equal(p.keys().filter(([, on]) => !on).length, 2, why);
+    p.audio.messages.length = 0;
+    gesture(p, 'gesturechange'); assert.deepEqual(p.keys(), [], why);
+  }
+  const p = await inputPage();
+  gesture(p, 'gesturestart');
+  p.pointer('pointerdown', 1); p.pointer('pointerup', 1);
+  assert.deepEqual(p.keys(), [[21, true], [21, false]]);
+});
+
+
+test('anchor expiry and invalid calibration release the original pointer owner', async () => {
+  for (const invalid of [false, true]) {
+    const p = await estimatedPage();
+    p.pointer('pointerdown', 1, 10, 60, { isTrusted: true, pointerType: 'mouse' });
+    if (invalid) gesture(p, 'gesturestart', { scale: NaN });
+    else p.clock.advance(10001);
+    assert.deepEqual(p.keys(), [[21, true], [21, false]]);
+    assert.equal(p.panel.captures.size, 0);
+    p.audio.messages.length = 0;
+    gesture(p, 'gesturechange'); assert.deepEqual(p.audio.messages, []);
+  }
+});
+test('a canvas-target gesture outside the panel or under an overlay terminates the trial', async () => {
+  for (const overlay of [false, true]) {
+    const p = await estimatedPage(); beginPair(p);
+    if (overlay) p.document.elementFromPoint = () => new Element();
+    gesture(p, 'gesturechange', overlay ? {} : { clientX: 120 });
+    assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false], [22, false]]);
+    p.audio.messages.length = 0;
+    if (overlay) p.document.elementFromPoint = () => p.panel;
+    gesture(p, 'gesturechange'); assert.deepEqual(p.audio.messages, []);
+  }
+});
+test('Space on the Release button is a browser activation, not synth PLAY', async () => {
+  const p = await estimatedPage(); beginPair(p);
+  const button = p.elements.get('touch-release'); button.tagName = 'BUTTON';
+  assert.notEqual(p.key('keydown', ' ', 'Space', { target: button }).defaultPrevented, true);
+  assert.deepEqual(p.keys(), [[21, true], [22, true]]);
+  button.dispatch('click'); // the browser's normal keyboard button activation
+  assert.deepEqual(p.keys(), [[21, true], [22, true], [21, false], [22, false]]);
+  p.key('keyup', ' ', 'Space', { target: button });
+});
+test('focus loss before calibration requires an explicit re-arm', async () => {
+  const p = await estimatedPage(); p.fireWindow('blur');
+  p.pointer('pointerdown', 1, 10, 60, { isTrusted: true, pointerType: 'mouse' });
+  gesture(p, 'gesturestart');
+  assert.deepEqual(p.keys(), []);
 });

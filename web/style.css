@@ -295,3 +295,12 @@ section li { margin: 4px 0; }
 
 /* (an element the page hides stays hidden whatever its display rule) */
 [hidden] { display: none !important; }
+
+/* Kept outside the instrument hit area; estimates never impersonate contacts. */
+.touch-experiment { border: 1px solid var(--rule); border-radius: 12px; padding: 12px 14px; font-size: 13px; }
+.touch-experiment summary { cursor: pointer; font-weight: 600; }
+.touch-experiment p { color: var(--dim); line-height: 1.5; margin: 10px 0 0; }
+.touch-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+.touch-actions label { display: inline-flex; align-items: center; gap: 7px; }
+.touch-actions button { font-size: 12px; }
+[data-embed] .touch-experiment { display: none; }

@@ -52,6 +52,17 @@
         <canvas id="panel" aria-label="SMK-37 front panel"></canvas>
         <button id="start">Start</button>
       </div>
+      <details class="touch-experiment">
+        <summary>Experimental Safari two-finger input</summary>
+        <p>Estimates two positions from Safari gestures. Short moving notes only: notes stop after
+          0.5 seconds without updates. Independent finger lifts and motionless chords are not supported.</p>
+        <div class="touch-actions">
+          <label><input type="checkbox" id="touch-estimates"> Enable estimated two-note trial</label>
+          <button type="button" id="touch-rearm" disabled>Re-arm</button>
+          <button type="button" id="touch-release">Release local notes</button>
+        </div>
+        <p id="touch-status" role="status" aria-live="polite">Off. Normal pointer, keyboard and MIDI controls are active.</p>
+      </details>
       <p class="rotate">Turn the phone sideways for a bigger keyboard.</p>
       <p class="hint">
         <span class="keyb"><kbd>A</kbd>…<kbd>'</kbd> play C4–F5</span>

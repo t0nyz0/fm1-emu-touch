@@ -6,6 +6,7 @@
 import { fetchPackage, hubNewcomers, hubCardUrl } from "./fwsc.js";
 import { SaveStore, packageHash, changedSectors, packSectors, exportSave, importSave } from "./persistence.js";
 import { tryOutOf, loadTryOut } from "./tryout.js";
+import { createWheelControlNormalizer, createSafariPairEstimator } from "./gesture-input.js";
 
 const CLOCKS = [60, 80, 100, 120, 160, 200, 240];
 // The device this page is for: the FM-1 (index.html) or the SMK-37 (smk37/index.html, <html
@@ -84,6 +85,10 @@ let latency = params.get("latency") || stored("fm1.latency") || "interactive";
 
 const canvas = document.getElementById("panel");
 const ctx = canvas.getContext("2d");
+// Experimental model state is separate from real browser pointers and MIDI.
+let safariPair = null, wheelControls = null;
+let estimatesEnabled = false, waitingForAnchor = false, estimateClaimsPointers = false;
+let estimatedPoints = null, estimatedNotes = [], estimateMapping = null;
 const status = document.getElementById("status");
 const startBtn = document.getElementById("start");
 const fwSel = document.getElementById("fw");
@@ -454,6 +459,19 @@ function draw() {
   const p = ui.panel_draw();
   const img = new ImageData(new Uint8ClampedArray(mem(), p, W * H * 4), W, H);
   ctx.putImageData(img, 0, 0);
+  if (estimatedPoints) {
+    const r = canvas.getBoundingClientRect();
+    ctx.save();
+    estimatedPoints.forEach((point, i) => {
+      const x = (point.x - r.left) * W / r.width, y = (point.y - r.top) * H / r.height;
+      if (x < 0 || y < 0 || x > W || y > H) return;
+      ctx.strokeStyle = i ? "#ffce55" : "#59d6ff";
+      ctx.fillStyle = ctx.strokeStyle; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(x, y, 10, 0, Math.PI * 2); ctx.stroke();
+      ctx.font = "bold 12px system-ui"; ctx.fillText(i ? "B (estimate)" : "A (estimate)", x + 14, y - 8);
+    });
+    ctx.restore();
+  }
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
@@ -522,6 +540,13 @@ function releaseKeyboard(code) {
   else unpress(held.id);
 }
 function releaseInputs(includeMidi = false) {
+  safariPair?.end("Input interrupted. Re-arm to recalibrate.");
+  clearEstimatedNotes();
+  if (estimatesEnabled) {
+    waitingForAnchor = false; estimateClaimsPointers = true; estimateMapping = null;
+    setEstimateStatus("Input interrupted. Re-arm or disable the trial to continue.");
+  }
+  wheelControls?.reset();
   for (const id of [...pointers.keys()]) releasePointer(id);
   for (const code of [...keyboard.keys()]) releaseKeyboard(code);
   if (includeMidi) {
@@ -533,8 +558,16 @@ function releaseInputs(includeMidi = false) {
   }
 }
 canvas.addEventListener("pointerdown", (e) => {
-  if (booting) return;
+  if (booting || estimateClaimsPointers) return;
   if (e.pointerType === "mouse" && e.button !== 0) return;
+  if (estimatesEnabled && waitingForAnchor && e.isTrusted === true && e.button === 0
+      && ["mouse", "touch"].includes(e.pointerType)) {
+    estimateMapping = readEstimateMapping();
+    if (estimateMapping && safariPair.arm({ x: e.clientX, y: e.clientY })) {
+      waitingForAnchor = false;
+      setEstimateStatus("Hold the first finger still; add the second, then move gently.");
+    }
+  }
   e.preventDefault();
   releasePointer(e.pointerId);
   const [x, y] = at(e), grab = ui.panel_hit(x, y);
@@ -561,6 +594,7 @@ function slide(p, y) {
   else setAnalog(p.grab === 400 ? 20 : 21, ui.panel_slide(p.grab === 400 ? 4 : 5, y));
 }
 function movePointer(e) {
+  if (estimateClaimsPointers) return;
   const p = pointers.get(e.pointerId);
   if (!p) return;
   if (e.pointerType === "mouse" && !(e.buttons & 1)) { releasePointer(e.pointerId); return; }
@@ -595,23 +629,130 @@ for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) canvas.
 for (const type of ["pointerup", "pointercancel"]) addEventListener(type, release);
 canvas.addEventListener("contextmenu", e => e.preventDefault());
 addEventListener("blur", () => releaseInputs());
-let wheelAcc = 0;
+// Normalize browser wheel units and keep each encoder's remainder independent.
+wheelControls = createWheelControlNormalizer({ pagePixels: () => canvas.getBoundingClientRect().height });
 canvas.addEventListener("wheel", (e) => {
-  if (booting) return;
-  const [x, y] = at(e);
-  const h = ui.panel_hit(x, y);
-  if (board === 1 && h >= 300 && h < 304) {          // SMK-37: a fader scrolled
-    e.preventDefault();
-    setAnalog(16 + h - 300, analog[16 + h - 300] - e.deltaY * 2);
+  if (booting || estimateClaimsPointers) return;
+  const [x, y] = at(e), h = ui.panel_hit(x, y);
+  if (!((board === 1 && h >= 300 && h < 304) || (h >= 0 && h <= 7))) return;
+  const wheel = wheelControls.normalize(e, `${board}:${h}`);
+  if (!wheel) return; // Ctrl/Command-wheel belongs to browser zoom, never a synth knob.
+  e.preventDefault();
+  if (board === 1 && h >= 300 && h < 304) {
+    setAnalog(16 + h - 300, analog[16 + h - 300] - wheel.deltaY * 2);
+  } else if (board === 0 && h === 7) {
+    setPot(pot - wheel.deltaY * 0.5);
+  } else {
+    const clicks = wheelControls.encoderSteps(wheel.controlId, -wheel.deltaY);
+    if (clicks) turn(h, clicks);
+  }
+}, { passive: false });
+
+// Explicit Safari experiment. These are reconstructed positions, not contacts.
+// Only musical keys are eligible: estimates cannot start recording, operate
+// transport, trigger pads or turn the physical controls. Silence terminates the trial.
+const estimateToggle = document.getElementById("touch-estimates");
+const estimateRearm = document.getElementById("touch-rearm");
+const estimateStatus = document.getElementById("touch-status");
+function setEstimateStatus(text) {
+  if (estimateStatus && estimateStatus.textContent !== text) estimateStatus.textContent = text;
+}
+function clearEstimatedNotes() {
+  const previous = estimatedNotes;
+  estimatedNotes = []; estimatedPoints = null;
+  for (const id of previous) if (id >= 0) unpress(id);
+}
+function readEstimateMapping() {
+  const r = canvas.getBoundingClientRect();
+  if (![r.left, r.top, r.width, r.height].every(Number.isFinite) || r.width <= 0 || r.height <= 0) return null;
+  const v = globalThis.visualViewport;
+  return JSON.stringify([r.left, r.top, r.width, r.height, W, H, board,
+    globalThis.innerWidth, globalThis.innerHeight, globalThis.devicePixelRatio,
+    globalThis.scrollX, globalThis.scrollY,
+    v && [v.offsetLeft, v.offsetTop, v.width, v.height, v.scale]]);
+}
+function noteAtEstimate(point) {
+  const r = canvas.getBoundingClientRect();
+  if (point.x < r.left || point.y < r.top || point.x >= r.left + r.width || point.y >= r.top + r.height) return -1;
+  const hit = ui.panel_hit((point.x - r.left) * W / r.width, (point.y - r.top) * H / r.height);
+  const min = board === 1 ? 100 : 114, max = board === 1 ? 137 : 141;
+  return hit >= min && hit < max ? hit - 100 : -1;
+}
+function applyEstimatedPair(points) {
+  if (!estimatesEnabled || booting || estimateMapping !== readEstimateMapping()) {
+    safariPair.end("Panel changed. Re-arm to recalibrate."); return;
+  }
+  const next = points.map(noteAtEstimate);
+  // Reconcile all model owners atomically: crossing or sharing the same key
+  // must not retrigger an unchanged note. Acquire before retiring the first
+  // compatibility pointer, preserving its existing note when calibration begins.
+  const counts = ids => ids.reduce((m, id) => { if (id >= 0) m.set(id, (m.get(id) || 0) + 1); return m; }, new Map());
+  const before = counts(estimatedNotes), after = counts(next);
+  for (const [id, n] of after) for (let i = before.get(id) || 0; i < n; i++) press(id);
+  for (const [id, n] of before) for (let i = after.get(id) || 0; i < n; i++) unpress(id);
+  estimatedNotes = next; estimatedPoints = points;
+  estimateClaimsPointers = true;
+  for (const id of [...pointers.keys()]) releasePointer(id);
+  setEstimateStatus("Estimated A/B playing · short moving notes only · held notes stop after 0.5 s of silence.");
+}
+safariPair = createSafariPairEstimator({
+  onPair: applyEstimatedPair,
+  onEnd: reason => {
+    clearEstimatedNotes();
+    // A calibration failure can occur before any model owners exist. Release
+    // the first compatibility pointer too, so an expired anchor cannot hang.
+    for (const id of [...pointers.keys()]) releasePointer(id);
+    waitingForAnchor = false;
+    if (estimatesEnabled) {
+      estimateClaimsPointers = true;
+      setEstimateStatus(`${reason} Re-arm or disable the trial to continue.`);
+    }
+  },
+});
+function rearmEstimates() {
+  if (!estimatesEnabled) return;
+  safariPair.end("Trial reset."); clearEstimatedNotes();
+  for (const id of [...pointers.keys()]) releasePointer(id);
+  wheelControls.reset();
+  estimateClaimsPointers = false; waitingForAnchor = true; estimateMapping = null;
+  setEstimateStatus("Ready: hold one screen finger still on a key, add the second, then move gently.");
+}
+estimateToggle?.addEventListener("change", () => {
+  estimatesEnabled = estimateToggle.checked;
+  estimateRearm.disabled = !estimatesEnabled;
+  if (estimatesEnabled) rearmEstimates();
+  else {
+    safariPair.end("Trial disabled."); clearEstimatedNotes();
+    for (const id of [...pointers.keys()]) releasePointer(id);
+    estimateClaimsPointers = false; waitingForAnchor = false; estimateMapping = null;
+    setEstimateStatus("Off. Normal pointer, keyboard and MIDI controls are active.");
+  }
+});
+estimateRearm?.addEventListener("click", rearmEstimates);
+document.getElementById("touch-release")?.addEventListener("click", () => releaseInputs());
+function safariGesture(e) {
+  if (!estimatesEnabled || booting || !estimateMapping) return;
+  if (estimateMapping !== readEstimateMapping()) { safariPair.end("Panel moved or resized."); return; }
+  const r = canvas.getBoundingClientRect();
+  const inside = Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
+    && e.clientX >= r.left && e.clientX <= r.left + r.width && e.clientY >= r.top && e.clientY <= r.top + r.height;
+  const hit = inside && document.elementFromPoint?.(e.clientX, e.clientY);
+  const own = inside && (hit ? hit === canvas : e.target === canvas);
+  if (!own) {
+    if (["armed", "tracking"].includes(safariPair.status)) safariPair.end("Gesture left the panel.");
     return;
   }
-  if (h < 0 || h > 7) return;
-  e.preventDefault();
-  if (board === 0 && h === 7) { setPot(pot - e.deltaY * 0.5); return; }
-  wheelAcc -= e.deltaY;
-  while (wheelAcc >= 40) { wheelAcc -= 40; turn(h, 1); }
-  while (wheelAcc <= -40) { wheelAcc += 40; turn(h, -1); }
-}, { passive: false });
+  safariPair.processGesture(e);
+}
+for (const type of ["gesturestart", "gesturechange", "gestureend"])
+  document.addEventListener(type, safariGesture, { capture: true, passive: false });
+function invalidateEstimateMapping() {
+  if (estimatesEnabled && estimateMapping) safariPair.end("Panel moved or resized.");
+}
+addEventListener("resize", invalidateEstimateMapping);
+addEventListener("scroll", invalidateEstimateMapping, true);
+globalThis.visualViewport?.addEventListener("resize", invalidateEstimateMapping);
+globalThis.visualViewport?.addEventListener("scroll", invalidateEstimateMapping);
 
 // computer keyboard: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z X OCT- OCT+, Space PLAY,
 // R REC, 1..0 FX SCL ENV LFO EDIT GLO HOME SAVE ARP SEQ, arrows / , . encoders. SMK-37: the same
@@ -633,7 +774,8 @@ const padKey = (k) => (board === 1 && /^[1-8]$/.test(k) ? Number(k) - 1 : -1);
 const keyboardCode = e => e.code || e.key.toLowerCase();
 addEventListener("keydown", (e) => {
   if (booting) return;
-  if (e.metaKey || e.ctrlKey || e.target?.isContentEditable || /^(SELECT|INPUT|TEXTAREA)$/.test(e.target?.tagName || "")) return;
+  if (e.metaKey || e.ctrlKey || e.target?.isContentEditable || /^(SELECT|INPUT|TEXTAREA|BUTTON|A|SUMMARY)$/.test(e.target?.tagName || "")
+      || e.target?.closest?.("button,a,summary,select,input,textarea")) return;
   if (ENC_KEYS[e.key]) { e.preventDefault(); turn(...ENC_KEYS[e.key]); return; }
   const code = keyboardCode(e);
   if (e.repeat || keyboard.has(code)) return;
