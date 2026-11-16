@@ -64,6 +64,27 @@ No use-gesture, React or prototype package dependency is added. No global captur
 browser settings or system permissions are required. Existing real pointer,
 keyboard, MIDI and native AppKit input paths remain in place.
 
+### Firefox and Mac mouse-emulation compatibility
+
+The Safari estimated-pair trial is disabled when `GestureEvent` is unavailable.
+It cannot then arm a session or lock out ordinary Firefox input. This fixes an
+unsupported-mode lockout in the initial browser port.
+
+**Mac screen input compatibility** is a separate, explicit single-pointer option
+(`?screen=1` opens it enabled). Some earlier Firefox screen-interaction traces
+contained secondary-button mouse events. Normal FM-1 input deliberately rejects
+those. This option allows them on the piano keybed only and tracks the correct
+button through dragging and release. It also affects real right-clicks on that
+keybed; mouse emulation does not reliably identify the physical input device.
+Recording/transport buttons, pads and knobs are excluded from this fallback.
+
+The mode includes a bounded page-local input report. It records recent panel
+event types/buttons and processing state so a failed screen test can distinguish
+rejected secondary input, wheel-only input, missing pointer events and very
+short taps. It is not global input capture, and nothing is transmitted. Copying
+is explicit. These changes do not establish Firefox multitouch or guarantee
+that a screen gesture produces a playable press. Physical validation is pending.
+
 ## Native panels
 
 The contact state tracks each finger independently. Keys and buttons remain

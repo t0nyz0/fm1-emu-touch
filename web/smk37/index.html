@@ -52,6 +52,21 @@
         <canvas id="panel" aria-label="SMK-37 front panel"></canvas>
         <button id="start">Start</button>
       </div>
+      <details class="touch-experiment" id="screen-input-help">
+        <summary>Mac screen input compatibility</summary>
+        <p>For screen holds reported as right-clicks. This mode also lets real right-clicks play piano
+          keys. It provides one pointer; it does not add independent fingers.</p>
+        <div class="touch-actions">
+          <label><input type="checkbox" id="screen-compat"> Enable single-pointer compatibility</label>
+        </div>
+        <p id="screen-input-status" role="status" aria-live="polite">Off. Normal input is active.</p>
+        <p>After Start, hold one screen finger on a piano key for a second, then lift.</p>
+        <details>
+          <summary>Input report · stays on this page</summary>
+          <pre id="screen-input-report" aria-label="Recent panel input events">No input recorded.</pre>
+          <button type="button" id="screen-report-copy">Copy input report</button>
+        </details>
+      </details>
       <details class="touch-experiment">
         <summary>Experimental Safari two-finger input</summary>
         <p>Estimates two positions from Safari gestures. Short moving notes only: notes stop after

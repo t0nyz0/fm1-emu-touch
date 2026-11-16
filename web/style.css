@@ -304,3 +304,6 @@ section li { margin: 4px 0; }
 .touch-actions label { display: inline-flex; align-items: center; gap: 7px; }
 .touch-actions button { font-size: 12px; }
 [data-embed] .touch-experiment { display: none; }
+
+.touch-experiment pre { max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  padding: 10px; border: 1px solid var(--rule); border-radius: 8px; font: 12px/1.5 ui-monospace, monospace; }

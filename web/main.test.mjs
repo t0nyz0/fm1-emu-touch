@@ -99,7 +99,7 @@ async function page(disk = storage(), initialSearch = '', selected = '', manualB
     matchMedia: () => ({ matches: false }), confirm: () => true,
     fetchPackage: async f => ({ bytes: new Uint8Array(960).fill(f.id === 'a' ? 1 : 2), url: f.package }),
     hubNewcomers: async () => [], hubCardUrl: id => `https://thefirmwarehub.com/#fw-${id}`,
-    ...persistence, ...tryout, ...gestureInput, SaveStore: class { constructor() { return disk; } }, ...extra };
+    GestureEvent: class {}, ...persistence, ...tryout, ...gestureInput, SaveStore: class { constructor() { return disk; } }, ...extra };
   const source = readFileSync(new URL('./main.js', import.meta.url), 'utf8').replace(/^import .*;$/gm, '');
   const run = new Function(...Object.keys(environment), `return (async () => { ${source}\nreturn {
     startAudio, boot, flushRunning, setLatency, get running() { return running; },
@@ -337,10 +337,10 @@ test('?package= plays a package from a link, named by &name=, and a reload fetch
 // Dispatch the page's real registered handlers; the small hit map isolates input ownership
 // from the Rust panel geometry. CSS / physical Safari gesture arbitration needs hardware QA.
 async function inputPage(board = 0, extra = {}) {
-  const p = await page(storage(), '', '', false, { ...extra, board, panelExports: {
+  const p = await page(storage(), extra.initialSearch || '', '', false, { ...extra, board, panelExports: {
     panel_hit: (x, y) => {
       if (y >= 50 && y < 90 && x >= 0 && x < 40) return (board ? 112 : 121) + Math.floor(x / 20);
-      if (y >= 30 && y < 50) return 112; // transport/control button, never an estimated note
+      if (y >= 30 && y < 50) return board ? 153 : 112; // transport/control button, never a note
       if (y >= 10 && y < 30) {
         if (x < 20) return board ? 200 : 0;
         if (x < 40) return board ? 400 : 1;
@@ -647,4 +647,139 @@ test('focus loss before calibration requires an explicit re-arm', async () => {
   p.pointer('pointerdown', 1, 10, 60, { isTrusted: true, pointerType: 'mouse' });
   gesture(p, 'gesturestart');
   assert.deepEqual(p.keys(), []);
+});
+
+
+test('a browser without Safari GestureEvent cannot enable the trial or lock out normal controls', async () => {
+  const clock = estimateClock();
+  const p = await inputPage(0, { GestureEvent: undefined, createSafariPairEstimator: clock.factory });
+  const toggle = p.elements.get('touch-estimates');
+  assert.equal(toggle.disabled, true);
+  assert.match(p.elements.get('touch-status').textContent, /unavailable in this browser/);
+  // Attempting to enable via stale/programmatic UI must not arm any timer.
+  enableEstimates(p);
+  assert.equal(toggle.checked, false);
+  p.elements.get('touch-rearm').dispatch('click');
+  p.pointer('pointerdown', 1); p.pointer('pointerup', 1);
+  clock.advance(10001);
+  p.pointer('pointerdown', 2); p.pointer('pointerup', 2);
+  assert.deepEqual(p.keys(), [[21, true], [21, false], [21, true], [21, false]]);
+  wheel(p, 10, -40);
+  assert.equal(p.audio.messages.filter(m => m.type === 'enc').at(-1).clicks, 1);
+  await p.api.boot(); p.audio.messages.length = 0;
+  p.pointer('pointerdown', 3); p.pointer('pointerup', 3);
+  assert.deepEqual(p.keys(), [[21, true], [21, false]], 'boot does not inherit an unsupported-trial lockout');
+});
+
+function screenMode(p, enabled = true) {
+  const toggle = p.elements.get('screen-compat');
+  toggle.checked = enabled; toggle.dispatch('change');
+}
+const secondary = (p, type, id = 0, x = 10, y = 60, fields = {}) => p.pointer(type, id, x, y,
+  { pointerType: 'mouse', button: type === 'pointermove' ? -1 : 2, buttons: type === 'pointerup' || type === 'pointercancel' ? 0 : 2, ...fields });
+
+test('secondary mouse notes remain rejected by default; opt-in holds use their own button mask', async () => {
+  const p = await inputPage();
+  secondary(p, 'pointerdown'); secondary(p, 'pointermove', 0, 30); secondary(p, 'pointerup', 0, 30);
+  assert.deepEqual(p.keys(), []);
+  screenMode(p);
+  secondary(p, 'pointerdown'); secondary(p, 'pointermove', 0, 30); secondary(p, 'pointerup', 0, 30);
+  assert.deepEqual(p.keys(), [[21, true], [21, false], [22, true], [22, false]]);
+  assert.equal(p.panel.captures.size, 0);
+  p.audio.messages.length = 0;
+  secondary(p, 'pointerdown'); secondary(p, 'pointermove', 0, 10, 60, { buttons: 1 });
+  assert.deepEqual(p.keys(), [[21, true], [21, false]], 'a primary button cannot sustain a secondary owner');
+  secondary(p, 'pointermove', 0, 30);
+  assert.deepEqual(p.keys(), [[21, true], [21, false]], 'moves do not acquire new notes');
+});
+
+test('secondary compatibility input is piano-only on both boards and cannot acquire from outside', async () => {
+  for (const board of [0, 1]) {
+    const p = await inputPage(board); screenMode(p);
+    for (const [x, y] of [[10, 20], [30, 20], [50, 20], [10, 40], [90, 95]]) {
+      secondary(p, 'pointerdown', 0, x, y);
+      secondary(p, 'pointermove', 0, 10, 60);
+      secondary(p, 'pointerup');
+    }
+    p.panel.dispatch('wheel', { clientX: 10, clientY: 60, deltaY: -100, deltaMode: 0 });
+    assert.deepEqual(p.audio.messages, [], 'no pads, transport, knobs, faders or notes may be triggered from rejected starts');
+    assert.equal(p.panel.captures.size, 0);
+  }
+});
+
+test('screen mode changes release panel/model owners while preserving keyboard and MIDI holds', async () => {
+  const p = await inputPage(1); screenMode(p);
+  const input = { id: 'keyboard' };
+  p.api.midiMessage({ target: input, data: [0x90, 60, 100] });
+  p.key('keydown'); secondary(p, 'pointerdown');
+  screenMode(p, false);
+  assert.deepEqual(p.keys(), [[12, true]]);
+  secondary(p, 'pointerup'); p.key('keyup');
+  assert.deepEqual(p.keys(), [[12, true]], 'MIDI retains its independent note');
+  p.api.midiMessage({ target: input, data: [0x80, 60, 0] });
+  assert.deepEqual(p.keys(), [[12, true], [12, false]]);
+  const q = await estimatedPage(); beginPair(q); q.key('keydown');
+  screenMode(q);
+  assert.deepEqual(q.keys(), [[21, true], [22, true], [22, false]], 'changing modes releases estimates but preserves the keyboard owner');
+  assert.equal(q.elements.get('touch-estimates').checked, false);
+  gesture(q, 'gesturechange');
+  q.key('keyup'); assert.deepEqual(q.keys().at(-1), [21, false]);
+  enableEstimates(q);
+  assert.equal(q.elements.get('screen-compat').checked, false, 'enabling the Safari trial disables screen compatibility');
+  q.audio.messages.length = 0;
+  secondary(q, 'pointerdown'); secondary(q, 'pointerup');
+  assert.deepEqual(q.keys(), []);
+});
+
+test('compatibility owners release on cancellation, focus/page lifecycle and firmware replacement', async () => {
+  for (const why of ['pointercancel', 'lostpointercapture', 'blur', 'visibilitychange', 'pagehide', 'boot']) {
+    const p = await inputPage(); screenMode(p); secondary(p, 'pointerdown');
+    if (why === 'boot') await p.api.boot();
+    else if (why === 'visibilitychange') { p.document.visibilityState = 'hidden'; p.fireDocument(why); }
+    else if (why === 'pointercancel' || why === 'lostpointercapture') secondary(p, why);
+    else p.fireWindow(why);
+    assert.deepEqual(p.keys(), [[21, true], [21, false]], why);
+    assert.equal(p.panel.captures.size, 0, why);
+    p.audio.messages.length = 0;
+    secondary(p, 'pointermove'); secondary(p, 'pointerup');
+    assert.deepEqual(p.keys(), [], 'late moves and releases never acquire notes');
+  }
+});
+
+test('screen=1 explicitly enables compatibility and opens its help; primary controls stay normal', async () => {
+  const p = await inputPage(0, { initialSearch: '?screen=1', GestureEvent: undefined });
+  assert.equal(p.elements.get('screen-compat').checked, true);
+  assert.equal(p.elements.get('screen-input-help').open, true);
+  secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  p.pointer('pointerdown', 1, 30, 60, { pointerType: 'mouse', button: 0, buttons: 1 });
+  p.pointer('pointerup', 1, 30, 60, { pointerType: 'mouse', button: 0, buttons: 0 });
+  assert.deepEqual(p.keys(), [[21, true], [21, false], [22, true], [22, false]]);
+});
+
+test('local compatibility report is bounded, coordinate-free and records rejected input before filtering', async () => {
+  const p = await inputPage(); screenMode(p);
+  for (let i = 0; i < 10; i++) { secondary(p, 'pointerdown'); secondary(p, 'pointerup'); }
+  secondary(p, 'pointerdown', 0, 10, 20);
+  p.panel.dispatch('wheel', { clientX: 10, clientY: 20, deltaY: 10, deltaMode: 0, ctrlKey: true });
+  const report = JSON.parse(p.elements.get('screen-input-report').textContent);
+  assert.equal(report.events.length, 12);
+  assert.equal(report.events.at(-2).reason, 'secondary-note-only');
+  assert.equal(report.events.at(-1).type, 'wheel');
+  assert.equal(report.events.at(-1).reason, 'wheel-rejected');
+  assert.ok(report.events.every(e => Number.isFinite(e.timeMs) && (e.dtMs === null || e.dtMs >= 0)));
+  assert.ok(report.events.every(e => !('clientX' in e) && !('clientY' in e) && !('pointerId' in e) && !('key' in e)));
+  assert.equal(report.events.at(-2).button, 2);
+  assert.equal(report.events.at(-2).buttons, 2);
+});
+
+test('report copying requires the explicit button and degrades to selectable local text', async () => {
+  let copied = null;
+  const p = await inputPage(0, { navigator: { clipboard: { writeText: async text => { copied = text; } } } });
+  screenMode(p); secondary(p, 'pointerdown'); secondary(p, 'pointerup');
+  assert.equal(copied, null);
+  await p.elements.get('screen-report-copy').listeners.click();
+  assert.match(copied, /secondary-note-accepted/);
+  const q = await inputPage(); screenMode(q);
+  await q.elements.get('screen-report-copy').listeners.click();
+  assert.match(q.elements.get('screen-input-status').textContent, /Select and copy/);
 });

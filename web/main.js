@@ -89,6 +89,11 @@ const ctx = canvas.getContext("2d");
 let safariPair = null, wheelControls = null;
 let estimatesEnabled = false, waitingForAnchor = false, estimateClaimsPointers = false;
 let estimatedPoints = null, estimatedNotes = [], estimateMapping = null;
+let screenCompatEnabled = params.get("screen") === "1";
+const screenCompatToggle = document.getElementById("screen-compat");
+const screenInputStatus = document.getElementById("screen-input-status");
+const screenInputReport = document.getElementById("screen-input-report");
+let screenEvents = [], lastScreenEvent = null, lastScreenTime = null;
 const status = document.getElementById("status");
 const startBtn = document.getElementById("start");
 const fwSel = document.getElementById("fw");
@@ -523,6 +528,33 @@ function unpressPad(id) { if (padHolds[id] && --padHolds[id] === 0) setAnalog(id
 const keyboard = new Map();                // physical key -> the control it began holding
 const midiKeys = new Map();                // SMK MIDI input / source channel / note -> { id, input }
 const pointers = new Map();                // pointerId -> { grab, lastY, acc, held, keyDrag }
+const pianoGrab = grab => grab >= (board === 1 ? 100 : 114) && grab < (board === 1 ? 137 : 141);
+function showScreenReport() {
+  if (!screenInputReport) return;
+  const text = JSON.stringify({ mode: "optional secondary-button piano input", events: screenEvents }, null, 2);
+  screenInputReport.textContent = text;
+  if (screenInputReport.tagName === "TEXTAREA") screenInputReport.value = text;
+}
+function recordScreenEvent(e) {
+  if (!screenCompatEnabled || e === lastScreenEvent || !["pointerdown", "pointerup", "pointercancel", "wheel"].includes(e.type)) return null;
+  lastScreenEvent = e;
+  const now = performance.now();
+  const record = { type: e.type, pointerType: ["mouse", "touch", "pen"].includes(e.pointerType) ? e.pointerType : null,
+    button: Number.isInteger(e.button) ? e.button : null, buttons: Number.isInteger(e.buttons) ? e.buttons : null,
+    timeMs: Math.round(now * 10) / 10, dtMs: lastScreenTime === null ? null : Math.round((now - lastScreenTime) * 10) / 10,
+    booting: !!booting, trialLockout: estimateClaimsPointers, reason: booting ? "booting" : estimateClaimsPointers ? "trial-lockout" : "received" };
+  lastScreenTime = now;
+  screenEvents.push(record);
+  if (screenEvents.length > 12) screenEvents.shift();
+  showScreenReport();
+  return record;
+}
+function finishScreenEvent(record, reason, hit = null) {
+  if (!record) return;
+  record.reason = reason;
+  if (Number.isInteger(hit)) record.panelHit = hit;
+  showScreenReport();
+}
 function releasePointer(id) {
   const p = pointers.get(id);
   if (!p) return;
@@ -558,8 +590,14 @@ function releaseInputs(includeMidi = false) {
   }
 }
 canvas.addEventListener("pointerdown", (e) => {
+  const report = recordScreenEvent(e);
   if (booting || estimateClaimsPointers) return;
-  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const secondary = e.pointerType === "mouse" && e.button === 2;
+  if (e.pointerType === "mouse" && e.button !== 0 && !(screenCompatEnabled && secondary)) {
+    finishScreenEvent(report, "secondary-button-rejected"); return;
+  }
+  const [x, y] = at(e), grab = ui.panel_hit(x, y);
+  if (secondary && !pianoGrab(grab)) { finishScreenEvent(report, "secondary-note-only", grab); return; }
   if (estimatesEnabled && waitingForAnchor && e.isTrusted === true && e.button === 0
       && ["mouse", "touch"].includes(e.pointerType)) {
     estimateMapping = readEstimateMapping();
@@ -570,13 +608,13 @@ canvas.addEventListener("pointerdown", (e) => {
   }
   e.preventDefault();
   releasePointer(e.pointerId);
-  const [x, y] = at(e), grab = ui.panel_hit(x, y);
-  if (grab < 0) return;
+  if (grab < 0) { finishScreenEvent(report, "outside-controls", grab); return; }
   // Momentary controls share ownership. A knob / slider keeps its first contact.
   const shared = (grab >= 100 && grab < 200) || (board === 1 && grab >= 200 && grab < 216);
-  if (!shared && [...pointers.values()].some(p => p.grab === grab)) return;
+  if (!shared && [...pointers.values()].some(p => p.grab === grab)) { finishScreenEvent(report, "control-owned", grab); return; }
   const keys = board === 1 ? [0, NKEY] : [14, 41];
-  const p = { grab, lastY: y, acc: 0, held: -1, keyDrag: grab >= 100 + keys[0] && grab < 100 + keys[1] };
+  const p = { grab, lastY: y, acc: 0, held: -1, buttonMask: secondary ? 2 : 1,
+    keyDrag: grab >= 100 + keys[0] && grab < 100 + keys[1] };
   pointers.set(e.pointerId, p);
   // A pointer can cease being active before capture is established. Window-level
   // move/up/cancel handlers and focus cleanup still finish that contact safely.
@@ -586,6 +624,7 @@ canvas.addEventListener("pointerdown", (e) => {
     if (board === 1 && p.held < NKEY) setVelocity(ui.panel_hit_y());
     press(p.held);
   } else if (board === 1 && p.grab >= 200) slide(p, y);
+  finishScreenEvent(report, secondary ? "secondary-note-accepted" : "normal-pointer-accepted", grab);
 }, { passive: false });
 // SMK-37: a pad pressed, a fader or a wheel dragged
 function slide(p, y) {
@@ -597,7 +636,7 @@ function movePointer(e) {
   if (estimateClaimsPointers) return;
   const p = pointers.get(e.pointerId);
   if (!p) return;
-  if (e.pointerType === "mouse" && !(e.buttons & 1)) { releasePointer(e.pointerId); return; }
+  if (e.pointerType === "mouse" && !(e.buttons & p.buttonMask)) { releasePointer(e.pointerId); return; }
   const [x, y] = at(e);
   const keys = board === 1 ? [0, NKEY] : [14, 41];
   if (p.keyDrag) {
@@ -624,7 +663,12 @@ function movePointer(e) {
 }
 canvas.addEventListener("pointermove", movePointer);
 addEventListener("pointermove", e => { if (e.target !== canvas) movePointer(e); });
-const release = e => releasePointer(e.pointerId);
+const release = e => {
+  const owned = pointers.has(e.pointerId);
+  const report = e.target === canvas || owned ? recordScreenEvent(e) : null;
+  releasePointer(e.pointerId);
+  finishScreenEvent(report, owned ? "pointer-released" : "no-pointer-owner");
+};
 for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) canvas.addEventListener(type, release);
 for (const type of ["pointerup", "pointercancel"]) addEventListener(type, release);
 canvas.addEventListener("contextmenu", e => e.preventDefault());
@@ -632,11 +676,12 @@ addEventListener("blur", () => releaseInputs());
 // Normalize browser wheel units and keep each encoder's remainder independent.
 wheelControls = createWheelControlNormalizer({ pagePixels: () => canvas.getBoundingClientRect().height });
 canvas.addEventListener("wheel", (e) => {
+  const report = recordScreenEvent(e);
   if (booting || estimateClaimsPointers) return;
   const [x, y] = at(e), h = ui.panel_hit(x, y);
-  if (!((board === 1 && h >= 300 && h < 304) || (h >= 0 && h <= 7))) return;
+  if (!((board === 1 && h >= 300 && h < 304) || (h >= 0 && h <= 7))) { finishScreenEvent(report, "wheel-outside-controls", h); return; }
   const wheel = wheelControls.normalize(e, `${board}:${h}`);
-  if (!wheel) return; // Ctrl/Command-wheel belongs to browser zoom, never a synth knob.
+  if (!wheel) { finishScreenEvent(report, "wheel-rejected", h); return; } // Browser zoom never changes a synth knob.
   e.preventDefault();
   if (board === 1 && h >= 300 && h < 304) {
     setAnalog(16 + h - 300, analog[16 + h - 300] - wheel.deltaY * 2);
@@ -646,6 +691,7 @@ canvas.addEventListener("wheel", (e) => {
     const clicks = wheelControls.encoderSteps(wheel.controlId, -wheel.deltaY);
     if (clicks) turn(h, clicks);
   }
+  finishScreenEvent(report, "wheel-accepted", h);
 }, { passive: false });
 
 // Explicit Safari experiment. These are reconstructed positions, not contacts.
@@ -654,6 +700,11 @@ canvas.addEventListener("wheel", (e) => {
 const estimateToggle = document.getElementById("touch-estimates");
 const estimateRearm = document.getElementById("touch-rearm");
 const estimateStatus = document.getElementById("touch-status");
+// GestureEvent is a Safari-specific channel. Offering this trial without it
+// would arm a session that can never calibrate and lock ordinary input out.
+const supportsSafariEstimate = typeof GestureEvent === "function";
+if (estimateToggle) estimateToggle.disabled = !supportsSafariEstimate;
+if (!supportsSafariEstimate) setEstimateStatus("Safari gesture input is unavailable in this browser. Normal pointer, keyboard and MIDI controls remain active.");
 function setEstimateStatus(text) {
   if (estimateStatus && estimateStatus.textContent !== text) estimateStatus.textContent = text;
 }
@@ -710,7 +761,7 @@ safariPair = createSafariPairEstimator({
   },
 });
 function rearmEstimates() {
-  if (!estimatesEnabled) return;
+  if (!supportsSafariEstimate || !estimatesEnabled) return;
   safariPair.end("Trial reset."); clearEstimatedNotes();
   for (const id of [...pointers.keys()]) releasePointer(id);
   wheelControls.reset();
@@ -718,7 +769,18 @@ function rearmEstimates() {
   setEstimateStatus("Ready: hold one screen finger still on a key, add the second, then move gently.");
 }
 estimateToggle?.addEventListener("change", () => {
-  estimatesEnabled = estimateToggle.checked;
+  if (!supportsSafariEstimate) {
+    estimateToggle.checked = false; estimatesEnabled = false;
+    safariPair.end("Unsupported browser."); clearEstimatedNotes();
+    waitingForAnchor = false; estimateClaimsPointers = false; estimateMapping = null;
+    estimateRearm.disabled = true;
+    setEstimateStatus("Safari gesture input is unavailable in this browser. Normal pointer, keyboard and MIDI controls remain active.");
+    return;
+  }
+  const requested = estimateToggle.checked;
+  if (requested && screenCompatEnabled) setScreenCompatibility(false);
+  estimatesEnabled = requested;
+  estimateToggle.checked = requested;
   estimateRearm.disabled = !estimatesEnabled;
   if (estimatesEnabled) rearmEstimates();
   else {
@@ -730,6 +792,37 @@ estimateToggle?.addEventListener("change", () => {
 });
 estimateRearm?.addEventListener("click", rearmEstimates);
 document.getElementById("touch-release")?.addEventListener("click", () => releaseInputs());
+function setScreenCompatibility(enabled) {
+  safariPair?.end("Input mode changed."); clearEstimatedNotes();
+  for (const id of [...pointers.keys()]) releasePointer(id);
+  wheelControls?.reset();
+  estimatesEnabled = false; waitingForAnchor = false; estimateClaimsPointers = false; estimateMapping = null;
+  if (estimateToggle) estimateToggle.checked = false;
+  if (estimateRearm) estimateRearm.disabled = true;
+  screenCompatEnabled = !!enabled;
+  if (screenCompatToggle) screenCompatToggle.checked = screenCompatEnabled;
+  if (screenInputStatus) screenInputStatus.textContent = screenCompatEnabled
+    ? "On: secondary-button mouse input plays piano keys only. This includes real right-clicks; it is not independent touch detection."
+    : "Off. Normal pointer, keyboard and MIDI controls remain active.";
+  if (supportsSafariEstimate) setEstimateStatus("Off. Normal pointer, keyboard and MIDI controls are active.");
+  screenEvents = []; lastScreenEvent = null; lastScreenTime = null;
+  showScreenReport();
+}
+screenCompatToggle?.addEventListener("change", () => setScreenCompatibility(screenCompatToggle.checked));
+if (screenCompatToggle) screenCompatToggle.checked = screenCompatEnabled;
+if (screenCompatEnabled) {
+  const help = document.getElementById("screen-input-help");
+  if (help) help.open = true;
+  setScreenCompatibility(true);
+}
+document.getElementById("screen-report-copy")?.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(screenInputReport?.textContent || "No local input report.");
+    if (screenInputStatus) screenInputStatus.textContent = "Copied the local input report.";
+  } catch {
+    if (screenInputStatus) screenInputStatus.textContent = "Copy is unavailable. Select and copy the local report below.";
+  }
+});
 function safariGesture(e) {
   if (!estimatesEnabled || booting || !estimateMapping) return;
   if (estimateMapping !== readEstimateMapping()) { safariPair.end("Panel moved or resized."); return; }
